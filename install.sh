@@ -3,7 +3,6 @@
 # - 初始化系统 & 内核
 # - VLESS Reality (SNI=www.apple.com)
 # - Hysteria2 官方极简 (SNI=www.apple.com)
-# - TUIC v5
 # - Hy2 临时节点 + 审计 + GC
 # - nftables UDP 上行配额系统（自动持久化）
 
@@ -45,13 +44,8 @@ download_upstreams() {
   curl -fsSL "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh"
   chmod +x "${UP_BASE}/hysteria-install.sh"
 
-  # TUIC 二进制
-  curl -fsSL "${REPO_BASE}/tuic-server-1.0.0-x86_64-unknown-linux-gnu" -o /usr/local/bin/tuic-server
-  chmod +x /usr/local/bin/tuic-server
-
   echo "✅ 上游已更新："
   ls -l "$UP_BASE"
-  ls -l /usr/local/bin/tuic-server
 }
 
 # ------------------ 1. 系统更新 + 新内核 ------------------
@@ -429,131 +423,7 @@ EOF
   chmod +x /root/hy2_official_minimal_ipv4.sh
 }
 
-# ------------------ 4. TUIC v5 一键 ------------------
-
-install_tuic_script() {
-  echo "🧩 写入 /root/onekey_tuic_ipv4_selfsigned.sh ..."
-  cat >/root/onekey_tuic_ipv4_selfsigned.sh << 'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-check_debian12() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    echo "❌ 请以 root 运行"; exit 1
-  fi
-  local codename
-  codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2)
-  if [[ "$codename" != "bookworm" ]]; then
-    echo "❌ 仅支持 Debian 12 (bookworm)，当前: ${codename:-未知}"
-    exit 1
-  fi
-}
-
-check_debian12
-export DEBIAN_FRONTEND=noninteractive
-
-echo "=== [1/4] 安装依赖 ==="
-apt-get update -y || true
-apt-get install -y curl openssl || apt-get install -y curl
-
-echo
-echo "=== [2/4] 检测 IPv4 公网 IP ==="
-ADDR=$(
-  curl -4fsS https://ifconfig.me \
-  || curl -4fsS https://api.ipify.org \
-  || hostname -I 2>/dev/null | awk '{print $1}'
-)
-if [[ -z "$ADDR" ]]; then
-  echo "❌ 无法检测 IPv4 地址"; exit 1
-fi
-echo "检测到 IPv4: ${ADDR}"
-
-PORT=4443
-CERT=/etc/hysteria/server.crt
-KEY=/etc/hysteria/server.key
-
-echo
-echo "=== [3/4] 准备证书（优先复用 Hy2 自签） ==="
-if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
-  echo "未发现 $CERT / $KEY，自动生成新的自签证书..."
-  mkdir -p /etc/hysteria
-  openssl ecparam -genkey -name prime256v1 -out "$KEY"
-  openssl req -new -x509 -key "$KEY" -out "$CERT" -days 3650 -subj "/CN=www.apple.com"
-fi
-echo "使用证书：$CERT"
-echo "使用私钥：$KEY"
-
-echo
-echo "=== [4/4] 使用 /usr/local/bin/tuic-server 并写入配置 ==="
-if [[ ! -x /usr/local/bin/tuic-server ]]; then
-  echo "❌ 未找到 /usr/local/bin/tuic-server，请先执行主 install.sh 或手动放置该文件。"
-  exit 1
-fi
-
-mkdir -p /etc/tuic
-UUID=$(cat /proc/sys/kernel/random/uuid)
-PASS=$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c16)
-
-cat >/etc/tuic/config.json <<CFG
-{
-  "server": "0.0.0.0:${PORT}",
-  "users": {
-    "${UUID}": "${PASS}"
-  },
-  "certificate": "${CERT}",
-  "private_key": "${KEY}",
-  "congestion_control": "bbr",
-  "alpn": ["h3"],
-  "zero_rtt_handshake": true,
-  "log_level": "info"
-}
-CFG
-
-cat >/etc/systemd/system/tuic-server.service <<UNIT
-[Unit]
-Description=TUIC v5 IPv4 自签服务
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/tuic-server -c /etc/tuic/config.json
-Restart=on-failure
-LimitNOFILE=100000
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now tuic-server
-sleep 2
-systemctl status tuic-server --no-pager || true
-
-echo
-echo "===== ✅ TUIC v5 (1.0.0) IPv4 部署完成 ====="
-echo "地址：${ADDR}:${PORT}"
-echo "UUID：${UUID}"
-echo "密码：${PASS}"
-echo "证书：${CERT}"
-echo
-echo "Clash / Sing-box 示例："
-echo "type: tuic"
-echo "server: ${ADDR}"
-echo "port: ${PORT}"
-echo "uuid: ${UUID}"
-echo "password: ${PASS}"
-echo "alpn: [h3]"
-echo "udp: true"
-echo "skip-cert-verify: true"
-echo "sni: www.apple.com"
-echo
-echo "URL："
-echo "tuic://${UUID}:${PASS}@${ADDR}:${PORT}?congestion_control=bbr&alpn=h3&sni=www.apple.com&udp_relay_mode=native#tuic-ipv4-selfsigned"
-EOF
-
-  chmod +x /root/onekey_tuic_ipv4_selfsigned.sh
-}
-
-# ------------------ 5. Hy2 临时节点 + 审计 + GC ------------------
+# ------------------ 4. Hy2 临时节点 + 审计 + GC ------------------
 
 install_hy2_temp_audit() {
   echo "🧩 写入 /root/hy2_temp_audit_ipv4_all.sh 和相关脚本 ..."
@@ -903,7 +773,7 @@ EOF
   chmod +x /root/hy2_temp_audit_ipv4_all.sh
 }
 
-# ------------------ 6. nftables 配额系统 ------------------
+# ------------------ 5. nftables 配额系统 ------------------
 
 install_port_quota() {
   echo "🧩 部署 UDP 上行配额系统（nftables）..."
@@ -1062,7 +932,6 @@ main() {
   install_update_all
   install_vless_script
   install_hy2_script
-  install_tuic_script
   install_hy2_temp_audit
   install_port_quota
 
@@ -1074,7 +943,7 @@ main() {
 可用命令一览：
 
 1) 系统更新 + 新内核：
-   sudo update-all
+   update-all
    reboot
 
 2) VLESS Reality (IPv4, SNI=www.apple.com)：
@@ -1083,17 +952,14 @@ main() {
 3) Hysteria2 官方极简 + Clash 订阅：
    bash /root/hy2_official_minimal_ipv4.sh
 
-4) TUIC v5 自签 (IPv4)：
-   bash /root/onekey_tuic_ipv4_selfsigned.sh
-
-5) Hy2 临时节点 + 审计 + GC：
+4) Hy2 临时节点 + 审计 + GC：
    bash /root/hy2_temp_audit_ipv4_all.sh
    # 部署后：
    D=120 hy2_mktemp.sh     # 新建 120 秒临时节点
    hy2_audit.sh            # 查看全部节点状态
    hy2_clear_all.sh        # 手动清空所有临时节点
 
-6) UDP 上行配额（nftables）：
+5) UDP 上行配额（nftables）：
    pq_add.sh 40000 50      # 端口 40000 限制 50GiB 上行
    pq_audit.sh             # 查看所有端口配额使用
    pq_del.sh 40000         # 删除 40000 端口配额
@@ -1101,8 +967,8 @@ main() {
 所有 SNI/伪装域名已统一为： www.apple.com
 
 🎯 建议顺序：
-   1) sudo update-all && reboot
-   2) 跑 VLESS / Hy2 / TUIC 三个一键脚本
+   1) update-all && reboot
+   2) 跑 VLESS / Hy2 两个一键脚本
    3) 需要临时节点就跑 hy2_temp_audit_ipv4_all.sh 再 D=xxx hy2_mktemp.sh
    4) 需要限额就用 pq_add.sh / pq_audit.sh / pq_del.sh
 
