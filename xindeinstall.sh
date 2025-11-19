@@ -183,15 +183,25 @@ echo "=== 3. 生成 UUID 与 Reality 密钥 ==="
 UUID=$(cat /tmp/xray_uuid.txt)
 
 KEY_OUT=$(/usr/local/bin/xray x25519)
-PRIVATE_KEY=$(printf '%s\n' "$KEY_OUT" | awk '/^PrivateKey:/ {print $2}')
-PUBLIC_KEY=$(printf '%s\n' "$KEY_OUT" | awk '/^Password:/ {print $2}')
-if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-  PRIVATE_KEY=$(printf '%s\n' "$KEY_OUT" | awk '/^Private key:/ {print $3}')
-  PUBLIC_KEY=$(printf '%s\n' "$KEY_OUT" | awk '/^Public key:/ {print $3}')
-fi
+
+PRIVATE_KEY=$(
+  printf '%s\n' "$KEY_OUT" | awk '
+    /^PrivateKey:/    {print $2; exit}
+    /^Private key:/   {print $3; exit}
+  '
+)
+
+PUBLIC_KEY=$(
+  printf '%s\n' "$KEY_OUT" | awk '
+    /^PublicKey:/     {print $2; exit}
+    /^Public key:/    {print $3; exit}
+  '
+)
+
 if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
   echo "❌ 无法解析 Reality 密钥："
-  echo "$KEY_OUT"; exit 1
+  echo "$KEY_OUT"
+  exit 1
 fi
 
 SHORT_ID=$(openssl rand -hex 8)
@@ -627,6 +637,15 @@ masquerade:
     rewriteHost: true
 CFG
 
+# 先写 meta，保证 hy2_run_temp 启动时能读到 EXPIRE_EPOCH 等信息
+cat >"$META" <<M
+TAG=$TAG
+PASS=$PASS
+PORT=$PORT
+SERVER_ADDR=$ADDR
+EXPIRE_EPOCH=$EXP
+M
+
 cat >"$UNIT" <<U
 [Unit]
 Description=Temp HY2 $TAG
@@ -644,14 +663,6 @@ U
 
 systemctl daemon-reload
 systemctl enable --now "$TAG".service
-
-cat >"$META" <<M
-TAG=$TAG
-PASS=$PASS
-PORT=$PORT
-SERVER_ADDR=$ADDR
-EXPIRE_EPOCH=$EXP
-M
 
 E_STR=$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')
 echo "✅ 新节点: $TAG
@@ -675,6 +686,7 @@ shopt -s nullglob
 NOW=$(date +%s)
 
 for META in /etc/hysteria/hy2-temp-*.meta; do
+  unset TAG EXPIRE_EPOCH
   . "$META" 2>/dev/null || continue
 
   if [[ -z "${TAG:-}" ]]; then
@@ -746,6 +758,7 @@ print_main "$MAIN_VLESS" "443" "vless-main"
 print_main "$MAIN_HY2"  "8443" "hy2-main"
 
 for META in /etc/hysteria/hy2-temp-*.meta; do
+  unset TAG PORT EXPIRE_EPOCH
   . "$META" 2>/dev/null || continue
 
   if [[ -z "${TAG:-}" || -z "${PORT:-}" ]]; then
@@ -796,6 +809,7 @@ if (( ${#META_FILES[@]} == 0 )); then
 fi
 
 for META in "${META_FILES[@]}"; do
+  unset TAG
   echo "--- 发现 meta: ${META}"
   . "$META" 2>/dev/null || continue
 
@@ -835,6 +849,9 @@ cat <<USE
 
 4) 手动强制清空所有临时节点（无视是否过期）：
    hy2_clear_all.sh
+
+5) 强制干掉某一个未过期节点示例：
+   FORCE=1 hy2_cleanup_one.sh hy2-temp-YYYYMMDDHHMMSS-ABCD
 
 ==========================================================
 USE
