@@ -186,15 +186,18 @@ KEY_OUT=$(/usr/local/bin/xray x25519)
 
 PRIVATE_KEY=$(
   printf '%s\n' "$KEY_OUT" | awk '
-    /^PrivateKey:/    {print $2; exit}
-    /^Private key:/   {print $3; exit}
+    /^PrivateKey:/   {print $2; exit}
+    /^Private key:/  {print $3; exit}
   '
 )
 
 PUBLIC_KEY=$(
   printf '%s\n' "$KEY_OUT" | awk '
-    /^PublicKey:/     {print $2; exit}
-    /^Public key:/    {print $3; exit}
+    # 旧版: 显示为 PublicKey:/Public key:
+    /^PublicKey:/    {print $2; exit}
+    /^Public key:/   {print $3; exit}
+    # 新版 (2025.10+): 把原先 PublicKey 重命名为 Password:
+    /^Password:/     {print $2; exit}
   '
 )
 
@@ -662,7 +665,18 @@ WantedBy=multi-user.target
 U
 
 systemctl daemon-reload
-systemctl enable --now "$TAG".service
+
+# 先 enable（失败不会让整个脚本崩）
+if ! systemctl enable "$TAG".service >/dev/null 2>&1; then
+  echo "⚠️ 无法 enable $TAG.service（可以稍后手动 systemctl enable $TAG.service）"
+fi
+
+# 再 start，如失败则回滚清理
+if ! systemctl start "$TAG".service; then
+  echo "❌ 启动临时 Hy2 服务失败，正在回滚..."
+  FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  exit 1
+fi
 
 E_STR=$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')
 echo "✅ 新节点: $TAG
