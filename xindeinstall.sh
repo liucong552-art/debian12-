@@ -514,6 +514,12 @@ set -euo pipefail
 TAG="${1:?need TAG}"
 CFG="${2:?need config path}"
 
+# 确保 timeout 存在
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "[hy2_run_temp] 'timeout' 未安装，请先安装 coreutils 包" >&2
+  exit 1
+fi
+
 META="/etc/hysteria/${TAG}.meta"
 if [[ ! -f "$META" ]]; then
   echo "[hy2_run_temp] meta not found: $META" >&2
@@ -555,6 +561,12 @@ cat >/usr/local/sbin/hy2_mktemp.sh << 'MK'
 #!/usr/bin/env bash
 set -euo pipefail
 : "${D:?请用 D=秒 hy2_mktemp.sh 方式调用，例如：D=300 hy2_mktemp.sh}"
+
+# 校验 D 必须是正整数
+if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
+  echo "❌ D 必须是正整数秒，例如：D=600 hy2_mktemp.sh" >&2
+  exit 1
+fi
 
 HY2_BIN=$(command -v hysteria || echo /usr/local/bin/hysteria)
 [ -x "$HY2_BIN" ] || { echo "❌ 未找到 hysteria 可执行文件"; exit 1; }
@@ -1009,9 +1021,15 @@ set -euo pipefail
 
 TMP="/etc/nftables.conf.tmp"
 DST="/etc/nftables.conf"
+LOG="/var/log/pq-save.log"
 
-nft list ruleset > "$TMP"
+if ! nft list ruleset > "$TMP"; then
+  echo "$(date '+%F %T %Z') [pq-save] nft list ruleset 失败，未更新 $DST" >> "$LOG"
+  exit 1
+fi
+
 mv "$TMP" "$DST"
+echo "$(date '+%F %T %Z') [pq-save] saved nftables ruleset to $DST" >> "$LOG"
 SAVE
   chmod +x /usr/local/sbin/pq_save.sh
 
