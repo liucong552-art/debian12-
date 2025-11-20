@@ -43,7 +43,7 @@ download_upstreams() {
   chmod +x "${UP_BASE}/xray-install-release.sh"
 
   # Hysteria 安装脚本
-  curl -fsSL "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh"
+  curl -fsSL "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh}"
   chmod +x "${UP_BASE}/hysteria-install.sh"
 
   echo "✅ 上游已更新："
@@ -169,6 +169,14 @@ echo "=== 1. 启用 BBR ==="
 cat >/etc/sysctl.d/99-bbr.conf <<SYS
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+# 提高 UDP/TCP 缓冲，缓解高延迟/高丢包环境下的带宽损耗
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.ipv4.udp_rmem_min=262144
+net.ipv4.udp_wmem_min=262144
+net.ipv4.tcp_mtu_probing=1
 SYS
 modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-bbr.conf || true
@@ -919,14 +927,28 @@ if ! [[ "$GIB" =~ ^[0-9]+$ ]]; then
 fi
 BYTES=$((GIB * 1024 * 1024 * 1024))
 
-nft -a list chain inet portquota down_out 2>/dev/null | \
- awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
-   nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
- done
+# 兼容旧版 nft：若新语法失败，回退到 quota over … bytes 规则
+add_rule() {
+  local syntax="$1"
+  if nft -a list chain inet portquota down_out 2>/dev/null | \
+     awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
+       nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
+     done; then
+    :
+  fi
 
-nft add rule inet portquota down_out udp sport "$PORT" counter limit rate over "$BYTES" bytes drop
-nft list ruleset > /etc/nftables.conf
-echo "✅ 已为 UDP 端口 $PORT 设置上行配额 ${GIB}GiB"
+  if nft add rule inet portquota down_out udp sport "$PORT" counter $syntax 2>/dev/null; then
+    nft list ruleset > /etc/nftables.conf
+    echo "✅ 已为 UDP 端口 $PORT 设置上行配额 ${GIB}GiB (语法: $syntax)"
+    exit 0
+  fi
+}
+
+add_rule "quota over ${BYTES} bytes drop"
+add_rule "limit rate over ${BYTES} bytes drop"
+
+echo "❌ 未能添加配额规则，请检查 nftables 版本或语法支持"
+exit 1
 ADD
   chmod +x /usr/local/sbin/pq_add.sh
 
