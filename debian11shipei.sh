@@ -39,11 +39,25 @@ download_upstreams() {
   mkdir -p "$UP_BASE"
 
   # Xray 安装脚本
-  curl -fsSL "${REPO_BASE}/xray-install-release.sh" -o "${UP_BASE}/xray-install-release.sh"
+  if ! curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused "${REPO_BASE}/xray-install-release.sh" -o "${UP_BASE}/xray-install-release.sh"; then
+    echo "❌ 无法下载 xray-install-release.sh (已尝试多次)"
+    exit 1
+  fi
+  if [[ ! -s "${UP_BASE}/xray-install-release.sh" ]]; then
+    echo "❌ 下载的 xray-install-release.sh 为空"
+    exit 1
+  fi
   chmod +x "${UP_BASE}/xray-install-release.sh"
 
   # Hysteria 安装脚本
-  curl -fsSL "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh}"
+  if ! curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh"; then
+    echo "❌ 无法下载 hysteria-install.sh (已尝试多次)"
+    exit 1
+  fi
+  if [[ ! -s "${UP_BASE}/hysteria-install.sh" ]]; then
+    echo "❌ 下载的 hysteria-install.sh 为空"
+    exit 1
+  fi
   chmod +x "${UP_BASE}/hysteria-install.sh"
 
   echo "✅ 上游已更新："
@@ -847,7 +861,7 @@ fi
 for META in "${META_FILES[@]}"; do
   unset TAG
   echo "--- 发现 meta: ${META}"
-  . "$META" 2>/dev/null || continue
+  . "$META" 2>/div>
 
   if [[ -z "${TAG:-}" ]]; then
     echo "  ⚠️  跳过：${META} 中没有 TAG"
@@ -902,13 +916,14 @@ EOF
 install_port_quota() {
   echo "🧩 部署 UDP 上行配额系统（nftables）..."
   apt-get update -y >/dev/null || true
-  apt-get install -y nftables >/dev/null || true
+  apt-get install -y nftables >/div>
+
   mkdir -p /etc/portquota
 
   if ! nft list table inet portquota >/dev/null 2>&1; then
     nft add table inet portquota
   fi
-  if ! nft list chain inet portquota down_out >/dev/null 2>&1; then
+  if ! nft list chain inet portquota down_out >/dev/null 2>/dev/null; then
     nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
   fi
 
@@ -930,14 +945,14 @@ BYTES=$((GIB * 1024 * 1024 * 1024))
 # 兼容旧版 nft：若新语法失败，回退到 quota over … bytes 规则
 add_rule() {
   local syntax="$1"
-  if nft -a list chain inet portquota down_out 2>/dev/null | \
+  if nft -a list chain inet portquota down_out 2>/div>/dev/null | \
      awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
-       nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
+       nft delete rule inet portquota down_out handle "$h" 2>/div>/dev/null || true
      done; then
     :
   fi
 
-  if nft add rule inet portquota down_out udp sport "$PORT" counter $syntax 2>/dev/null; then
+  if nft add rule inet portquota down_out udp sport "$PORT" counter $syntax 2>/div>/dev/null; then
     nft list ruleset > /etc/nftables.conf
     echo "✅ 已为 UDP 端口 $PORT 设置上行配额 ${GIB}GiB (语法: $syntax)"
     exit 0
@@ -959,9 +974,9 @@ PORT="${1:-}"
 if [[ -z "$PORT" ]]; then
   echo "用法: pq_del.sh <端口>" >&2; exit 1
 fi
-nft -a list chain inet portquota down_out 2>/dev/null | \
+nft -a list chain inet portquota down_out 2>/div>/div/null | \
  awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
-   nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
+   nft delete rule inet portquota down_out handle "$h" 2>/div>/div/null || true
  done
 nft list ruleset > /etc/nftables.conf
 echo "✅ 已删除 UDP 端口 $PORT 的配额规则"
@@ -972,7 +987,7 @@ DEL
 #!/usr/bin/env bash
 set -euo pipefail
 echo "==== 当前 UDP 上行配额 ===="
-nft -a list chain inet portquota down_out 2>/dev/null | awk '
+nft -a list chain inet portquota down_out 2>/div>/dev/null | awk '
   /handle/ && /udp sport/ {
     port=$6; handle=$NF;
     gsub(/[^0-9]/,"",port);
