@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Debian 11 一键部署脚本
 # - 初始化系统 & 内核
-# - VLESS Reality (SNI=www.apple.com)
-# - Hysteria2 官方极简 (SNI=www.apple.com)
-# - Hy2 临时节点 + 审计 + GC（绝对时间 TTL）
-# - nftables UDP 上行配额系统（自动持久化 + 1 分钟保存快照）
+# - VLESS Reality 主节点 (SNI=www.apple.com)
+# - VLESS 临时节点 + 审计 + GC（绝对时间 TTL）
+# - nftables TCP 上行配额系统（自动持久化 + 1 分钟保存快照）
 
 set -euo pipefail
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
-UP_BASE="/usr/local/src/debian12-upstream"
+UP_BASE="/usr/local/src/debian11-upstream"
 
 # ------------------ 公共函数 ------------------
 
@@ -29,7 +28,9 @@ check_debian11() {
 need_basic_tools() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y || true
-  apt-get install -y curl wget openssl python3 nftables || apt-get install -y curl wget openssl
+  # Debian 11 建议补齐 iproute2（ss 命令用得到）
+  apt-get install -y curl wget openssl python3 nftables iproute2 coreutils || \
+    apt-get install -y curl wget openssl python3 iproute2 coreutils
 }
 
 download_upstreams() {
@@ -39,10 +40,6 @@ download_upstreams() {
   # Xray 安装脚本
   curl -fsSL "${REPO_BASE}/xray-install-release.sh" -o "${UP_BASE}/xray-install-release.sh"
   chmod +x "${UP_BASE}/xray-install-release.sh"
-
-  # Hysteria 安装脚本
-  curl -fsSL "${REPO_BASE}/hysteria-install.sh" -o "${UP_BASE}/hysteria-install.sh"
-  chmod +x "${UP_BASE}/hysteria-install.sh"
 
   echo "✅ 上游已更新："
   ls -l "$UP_BASE"
@@ -92,7 +89,7 @@ BEOF
 
 apt-get update -y
 
-echo "🔧 从 backports 安装最新内核 (linux-image-amd64 / linux-headers-amd64)..."
+echo "🔧 从 backports 安装较新内核 (linux-image-amd64 / linux-headers-amd64)..."
 apt-get -t bullseye-backports install -y linux-image-amd64 linux-headers-amd64
 
 echo
@@ -116,7 +113,7 @@ install_vless_script() {
 set -e
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
-UP_BASE="/usr/local/src/debian12-upstream"
+UP_BASE="/usr/local/src/debian11-upstream"
 
 check_debian11() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -193,10 +190,8 @@ PRIVATE_KEY=$(
 
 PUBLIC_KEY=$(
   printf '%s\n' "$KEY_OUT" | awk '
-    # 旧版: 显示为 PublicKey:/Public key:
     /^PublicKey:/    {print $2; exit}
     /^Public key:/   {print $3; exit}
-    # 新版 (2025.10+): 把原先 PublicKey 重命名为 Password:
     /^Password:/     {print $2; exit}
   '
 )
@@ -283,199 +278,45 @@ EOF
   chmod +x /root/onekey_reality_ipv4.sh
 }
 
-# ------------------ 3. Hy2 官方极简 一键 ------------------
+# ------------------ 3. VLESS 临时节点 + 审计 + GC（绝对时间 TTL） ------------------
 
-install_hy2_script() {
-  echo "🧩 写入 /root/hy2_official_minimal_ipv4.sh ..."
-  cat >/root/hy2_official_minimal_ipv4.sh << 'EOF'
+install_vless_temp_audit() {
+  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh 和相关脚本 ..."
+  cat >/root/vless_temp_audit_ipv4_all.sh << 'EOF'
 #!/usr/bin/env bash
+# VLESS 临时节点 + 审计 + GC (IPv4, Reality) 一键部署 / 覆盖（绝对时间 TTL）
 set -euo pipefail
 
-REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
-UP_BASE="/usr/local/src/debian12-upstream"
-
-check_debian11() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    echo "❌ 请以 root 运行"; exit 1
-  fi
-  local codename
-  codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2)
-  if [[ "$codename" != "bullseye" ]]; then
-    echo "❌ 仅支持 Debian 11 (bullseye)，当前: ${codename:-未知}"
-    exit 1
-  fi
-}
-
-install_hysteria_from_local_or_repo() {
-  mkdir -p "$UP_BASE"
-  local hy_installer="$UP_BASE/hysteria-install.sh"
-  if [[ ! -x "$hy_installer" ]]; then
-    echo "⬇ 从仓库获取 Hysteria 安装脚本..."
-    curl -fsSL "$REPO_BASE/hysteria-install.sh" -o "$hy_installer"
-    chmod +x "$hy_installer"
-  fi
-  echo "⚙ 安装 / 更新 Hysteria2..."
-  "$hy_installer"
-}
-
-check_debian11
-
-HY_PORT=8443
-SNI_HOST=www.apple.com
-
-echo "== [1] 安装依赖（不改软件源） =="
-apt-get update -y || true
-apt-get install -y curl openssl python3 || apt-get install -y curl openssl
-
-echo "== [2] 安装 Hysteria2（本地或仓库脚本） =="
-install_hysteria_from_local_or_repo
-
-echo "== [3] 获取 IPv4 公网 IP 和随机密码 =="
-PUB_IP=$(curl -4fsS https://ifconfig.me || hostname -I | awk '{print $1}')
-HY_PASS=$(openssl rand -base64 18 | tr -d "=/+")
-echo "公网 IP: ${PUB_IP}"
-echo "Hy2 密码: ${HY_PASS}"
-
-install -d -m 0755 /etc/hysteria
-
-echo "== [4] 生成 EC 自签证书（CN = ${SNI_HOST}） =="
-openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/server.key
-openssl req -x509 -new -key /etc/hysteria/server.key \
-  -out /etc/hysteria/server.crt \
-  -days 3650 \
-  -subj "/CN=${SNI_HOST}"
-
-echo "== [5] 写入官方极简版配置（IPv4 优先 + QUIC 优化） =="
-cat >/etc/hysteria/config.yaml <<CFG
-listen: :${HY_PORT}
-
-tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
-
-auth:
-  type: password
-  password: ${HY_PASS}
-
-quic:
-  alpn:
-    - h3
-    - h3-29
-  initStreamReceiveWindow: 26843545
-  maxStreamReceiveWindow: 26843545
-  initConnReceiveWindow: 67108864
-  maxConnReceiveWindow: 67108864
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
-  disablePathMTUDiscovery: false
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://${SNI_HOST}/
-    rewriteHost: true
-CFG
-
-chown -R hysteria:hysteria /etc/hysteria 2>/dev/null || true
-chmod 640 /etc/hysteria/*
-
-echo "== [6] 启动 Hysteria2 服务 =="
-systemctl enable --now hysteria-server
-sleep 2
-systemctl status hysteria-server --no-pager || true
-
-echo "== [7] 生成 Clash 订阅文件（/var/www/html/sub.yaml） =="
-install -d -m 0755 /var/www/html
-cat >/var/www/html/sub.yaml <<SUB
-proxies:
-  - name: hy2-${PUB_IP}
-    type: hysteria2
-    server: ${PUB_IP}
-    port: ${HY_PORT}
-    password: ${HY_PASS}
-    sni: ${SNI_HOST}
-    alpn:
-      - h3
-      - h3-29
-    skip-cert-verify: true
-    udp: true
-SUB
-
-echo "== [8] 启 HTTP 订阅服务 (8081) =="
-cat >/etc/systemd/system/sub-http-8081.service <<UNIT
-[Unit]
-Description=Simple HTTP server for subscription on :8081
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/var/www/html
-ExecStart=/usr/bin/python3 -m http.server 8081
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now sub-http-8081.service
-
-echo
-echo "===== ✅ Hysteria2 官方极简版部署完成 (IPv4, SNI=www.apple.com) ====="
-echo "Server: ${PUB_IP}:${HY_PORT}"
-echo "Password: ${HY_PASS}"
-echo
-echo "Clash 订阅:  http://${PUB_IP}:8081/sub.yaml"
-echo
-echo "客户端直链:"
-echo "hysteria2://${HY_PASS}@${PUB_IP}:${HY_PORT}/?insecure=1&alpn=h3,h3-29&sni=${SNI_HOST}#hy2-${PUB_IP}"
-echo
-echo "=================================================="
-EOF
-
-  chmod +x /root/hy2_official_minimal_ipv4.sh
-}
-
-# ------------------ 4. Hy2 临时节点 + 审计 + GC（绝对时间 TTL） ------------------
-
-install_hy2_temp_audit() {
-  echo "🧩 写入 /root/hy2_temp_audit_ipv4_all.sh 和相关脚本 ..."
-  cat >/root/hy2_temp_audit_ipv4_all.sh << 'EOF'
-#!/usr/bin/env bash
-# Hy2 临时节点 + 审计 + GC (IPv4) 一键部署 / 覆盖（绝对时间 TTL）
-set -euo pipefail
+XRAY_DIR="/usr/local/etc/xray"
 
 ########################################
 # 1) 单节点清理脚本（按 EXPIRE_EPOCH 判断）
 ########################################
-cat >/usr/local/sbin/hy2_cleanup_one.sh << 'CLEAN'
+cat >/usr/local/sbin/vless_cleanup_one.sh << 'CLEAN'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TAG="${1:?need TAG}"
 UNIT_NAME="${TAG}.service"
-META="/etc/hysteria/${TAG}.meta"
+XRAY_DIR="/usr/local/etc/xray"
+CFG="${XRAY_DIR}/${TAG}.json"
+META="${XRAY_DIR}/${TAG}.meta"
+LOG="/var/log/vless-gc.log"
 
-# 若需要无视过期时间强制清理，可用：
-#   FORCE=1 hy2_cleanup_one.sh TAG
 FORCE="${FORCE:-0}"
 
-# 1) 如果有 meta 且没有 FORCE=1，就检查是否已过期
 if [[ "$FORCE" != "1" && -f "$META" ]]; then
-  # 加载 EXPIRE_EPOCH 等变量
   . "$META" 2>/dev/null || true
-
   if [[ -n "${EXPIRE_EPOCH:-}" && "$EXPIRE_EPOCH" =~ ^[0-9]+$ ]]; then
     NOW=$(date +%s)
     if (( EXPIRE_EPOCH > NOW )); then
-      # 还没到期：不清理，直接退出
-      echo "[hy2_cleanup_one] ${TAG} 未到期 (EXPIRE_EPOCH=${EXPIRE_EPOCH}, NOW=${NOW})，跳过清理"
+      echo "[vless_cleanup_one] ${TAG} 未到期 (EXPIRE_EPOCH=${EXPIRE_EPOCH}, NOW=${NOW})，跳过清理"
       exit 0
     fi
   fi
 fi
 
-echo "[hy2_cleanup_one] 开始清理: ${TAG}"
+echo "[vless_cleanup_one] 开始清理: ${TAG}"
 
 ACTIVE_STATE="$(systemctl show -p ActiveState --value "${UNIT_NAME}" 2>/dev/null || echo "")"
 
@@ -487,49 +328,47 @@ fi
 
 systemctl disable "${UNIT_NAME}" >/dev/null 2>&1 || true
 
-for f in \
-  "/etc/systemd/system/${UNIT_NAME}" \
-  "/etc/hysteria/${TAG}.yaml" \
-  "/etc/hysteria/${TAG}.meta" \
-  "/var/log/${TAG}.log"
-do
-  rm -f "$f" 2>/dev/null || true
-done
+rm -f "$CFG" "$META" "/etc/systemd/system/${UNIT_NAME}" 2>/dev/null || true
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-echo "[hy2_cleanup_one] 完成清理: ${TAG}"
-echo "$(date '+%F %T %Z') cleanup ${TAG}" >> /var/log/hy2-gc.log 2>/dev/null || true
+echo "[vless_cleanup_one] 完成清理: ${TAG}"
+echo "$(date '+%F %T %Z') cleanup ${TAG}" >> "$LOG" 2>/dev/null || true
 CLEAN
-chmod +x /usr/local/sbin/hy2_cleanup_one.sh
+chmod +x /usr/local/sbin/vless_cleanup_one.sh
 
 ########################################
-# 2) 绝对时间 TTL 运行包装脚本：hy2_run_temp.sh
-#    每次启动前按 EXPIRE_EPOCH 计算剩余秒数，用 timeout 控制
+# 2) 绝对时间 TTL 运行包装脚本：vless_run_temp.sh
 ########################################
-cat >/usr/local/sbin/hy2_run_temp.sh << 'RUN'
+cat >/usr/local/sbin/vless_run_temp.sh << 'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TAG="${1:?need TAG}"
 CFG="${2:?need config path}"
 
-# 确保 timeout 存在
-if ! command -v timeout >/dev/null 2>&1; then
-  echo "[hy2_run_temp] 'timeout' 未安装，请先安装 coreutils 包" >&2
+XRAY_BIN=$(command -v xray || echo /usr/local/bin/xray)
+if [[ ! -x "$XRAY_BIN" ]]; then
+  echo "[vless_run_temp] xray binary not found" >&2
   exit 1
 fi
 
-META="/etc/hysteria/${TAG}.meta"
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "[vless_run_temp] 请安装 coreutils (缺少 timeout)" >&2
+  exit 1
+fi
+
+XRAY_DIR="/usr/local/etc/xray"
+META="${XRAY_DIR}/${TAG}.meta"
 if [[ ! -f "$META" ]]; then
-  echo "[hy2_run_temp] meta not found: $META" >&2
+  echo "[vless_run_temp] meta not found: $META" >&2
   exit 1
 fi
 
 . "$META" 2>/dev/null || true
 
 if [[ -z "${EXPIRE_EPOCH:-}" || ! "$EXPIRE_EPOCH" =~ ^[0-9]+$ ]]; then
-  echo "[hy2_run_temp] bad EXPIRE_EPOCH in $META" >&2
+  echo "[vless_run_temp] bad EXPIRE_EPOCH in $META" >&2
   exit 1
 fi
 
@@ -537,67 +376,94 @@ NOW=$(date +%s)
 REMAIN=$((EXPIRE_EPOCH - NOW))
 
 if (( REMAIN <= 0 )); then
-  echo "[hy2_run_temp] $TAG already expired (EXPIRE_EPOCH=$EXPIRE_EPOCH, NOW=$NOW)"
-  FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" 2>/dev/null || true
+  echo "[vless_run_temp] $TAG already expired (EXPIRE_EPOCH=$EXPIRE_EPOCH, NOW=$NOW)"
+  FORCE=1 /usr/local/sbin/vless_cleanup_one.sh "$TAG" 2>/dev/null || true
   exit 0
 fi
 
-HY2_BIN=$(command -v hysteria || echo /usr/local/bin/hysteria)
-if [[ ! -x "$HY2_BIN" ]]; then
-  echo "[hy2_run_temp] hysteria binary not found" >&2
-  exit 1
-fi
+echo "[vless_run_temp] run $TAG for up to ${REMAIN}s (expire at $EXPIRE_EPOCH)"
 
-echo "[hy2_run_temp] run $TAG for up to ${REMAIN}s (expire at $EXPIRE_EPOCH)"
-
-exec timeout "$REMAIN" "$HY2_BIN" server --config "$CFG"
+exec timeout "$REMAIN" "$XRAY_BIN" run -c "$CFG"
 RUN
-chmod +x /usr/local/sbin/hy2_run_temp.sh
+chmod +x /usr/local/sbin/vless_run_temp.sh
 
 ########################################
-# 3) 创建临时 Hy2 节点：D=秒 hy2_mktemp.sh
+# 3) 创建临时 VLESS 节点：D=秒 vless_mktemp.sh
 ########################################
-cat >/usr/local/sbin/hy2_mktemp.sh << 'MK'
+cat >/usr/local/sbin/vless_mktemp.sh << 'MK'
 #!/usr/bin/env bash
 set -euo pipefail
-: "${D:?请用 D=秒 hy2_mktemp.sh 方式调用，例如：D=300 hy2_mktemp.sh}"
+: "${D:?请用 D=秒 vless_mktemp.sh 方式调用，例如：D=600 vless_mktemp.sh}"
 
-# 校验 D 必须是正整数
 if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
-  echo "❌ D 必须是正整数秒，例如：D=600 hy2_mktemp.sh" >&2
+  echo "❌ D 必须是正整数秒，例如：D=600 vless_mktemp.sh" >&2
   exit 1
 fi
 
-HY2_BIN=$(command -v hysteria || echo /usr/local/bin/hysteria)
-[ -x "$HY2_BIN" ] || { echo "❌ 未找到 hysteria 可执行文件"; exit 1; }
+XRAY_BIN=$(command -v xray || echo /usr/local/bin/xray)
+[ -x "$XRAY_BIN" ] || { echo "❌ 未找到 xray 可执行文件"; exit 1; }
 
-TLS_CERT=""
-TLS_KEY=""
+XRAY_DIR="/usr/local/etc/xray"
+MAIN_CFG="${XRAY_DIR}/config.json"
 
-if [[ -f /etc/hysteria/config.yaml ]]; then
-  TLS_CERT=$(grep -E 'cert:' /etc/hysteria/config.yaml | awk '{print $2}' | head -n1 || true)
-  TLS_KEY=$(grep -E 'key:'  /etc/hysteria/config.yaml | awk '{print $2}' | head -n1 || true)
+if [[ ! -f "$MAIN_CFG" ]]; then
+  echo "❌ 未找到主 VLESS 配置 ${MAIN_CFG}，请先执行 onekey_reality_ipv4.sh" >&2
+  exit 1
 fi
 
-[[ -z "$TLS_CERT" || -z "$TLS_KEY" ]] && {
-  TLS_CERT="/etc/hysteria/server.crt"
-  TLS_KEY="/etc/hysteria/server.key"
-}
+# 从主配置中解析 Reality 参数（privateKey / dest / serverName）
+mapfile -t arr < <(python3 - "$MAIN_CFG" << 'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1]))
+ibs=cfg.get("inbounds",[])
+if not ibs:
+    print("")
+    print("")
+    print("")
+else:
+    ib=ibs[0]
+    rs=ib.get("streamSettings",{}).get("realitySettings",{})
+    pkey=rs.get("privateKey","")
+    dest=rs.get("dest","")
+    sns=rs.get("serverNames",[])
+    sni=sns[0] if sns else ""
+    print(pkey)
+    print(dest)
+    print(sni)
+PY
+)
 
-if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
-  echo "❌ 未找到可用证书，请先确保主 Hy2 已安装并生成 /etc/hysteria/server.crt / server.key"
+REALITY_PRIVATE_KEY="${arr[0]:-}"
+REALITY_DEST="${arr[1]:-}"
+REALITY_SNI="${arr[2]:-}"
+
+if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_DEST" ]]; then
+  echo "❌ 无法从 ${MAIN_CFG} 解析 Reality 配置" >&2
   exit 1
+fi
+
+if [[ -z "$REALITY_SNI" ]]; then
+  REALITY_SNI="${REALITY_DEST%%:*}"
+fi
+
+# 从主节点 URL 文件中解析 pbk（如果有）
+PBK=""
+if [[ -f /root/vless_reality_vision_url.txt ]]; then
+  LINE=$(sed -n '1p' /root/vless_reality_vision_url.txt 2>/dev/null || true)
+  if [[ -n "$LINE" ]]; then
+    PBK=$(grep -o 'pbk=[^&]*' <<< "$LINE" | head -n1 | cut -d= -f2)
+  fi
 fi
 
 PORT=40000
 while :; do
   USED=0
 
-  if ss -lunH 2>/dev/null | awk '{print $5}' | sed "s/.*://g" | grep -qx "$PORT"; then
+  if ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -qx "$PORT"; then
     USED=1
   fi
 
-  if grep -R "PORT=${PORT}" /etc/hysteria/hy2-temp-*.meta 2>/dev/null >/dev/null; then
+  if grep -R "PORT=${PORT}" "${XRAY_DIR}"/vless-temp-*.meta 2>/dev/null >/dev/null; then
     USED=1
   fi
 
@@ -607,69 +473,84 @@ while :; do
 
   PORT=$((PORT+1))
   if (( PORT > 50050 )); then
-    echo "❌ 在 40000-50050 范围内没有空闲 UDP 端口了。"
+    echo "❌ 在 40000-50050 范围内没有空闲 TCP 端口了。" >&2
     exit 1
   fi
 done
 
-PASS=$(head -c16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-16)
-TAG="hy2-temp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)"
-CFG2="/etc/hysteria/${TAG}.yaml"
-UNIT="/etc/systemd/system/${TAG}.service"
-META="/etc/hysteria/${TAG}.meta"
+UUID="$("$XRAY_BIN" uuid)"
+SHORT_ID="$(openssl rand -hex 8)"
+TAG="vless-temp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)"
+CFG="${XRAY_DIR}/${TAG}.json"
+META="${XRAY_DIR}/${TAG}.meta"
 
-mkdir -p /etc/hysteria
-
-ADDR=$(curl -4fsS https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+SERVER_ADDR=$(curl -4fsS https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 NOW=$(date +%s)
 EXP=$((NOW + D))
 
-cat >"$CFG2" <<CFG
-listen: ":${PORT}"
-tls:
-  cert: "$TLS_CERT"
-  key: "$TLS_KEY"
-auth:
-  type: password
-  password: "$PASS"
+mkdir -p "$XRAY_DIR"
 
-quic:
-  alpn:
-    - h3
-    - h3-29
-  initStreamReceiveWindow: 26843545
-  maxStreamReceiveWindow: 26843545
-  initConnReceiveWindow: 67108864
-  maxConnReceiveWindow: 67108864
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
-  disablePathMTUDiscovery: false
-
-masquerade:
-  type: proxy
-  proxy:
-    url: "https://www.apple.com/"
-    rewriteHost: true
+cat >"$CFG" <<CFG
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": [ "${REALITY_SNI}" ],
+          "privateKey": "${REALITY_PRIVATE_KEY}",
+          "shortIds": [ "${SHORT_ID}" ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "routeOnly": true,
+        "destOverride": ["http","tls","quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "block",  "protocol": "blackhole" }
+  ]
+}
 CFG
 
-# 先写 meta，保证 hy2_run_temp 启动时能读到 EXPIRE_EPOCH 等信息
 cat >"$META" <<M
 TAG=$TAG
-PASS=$PASS
+UUID=$UUID
 PORT=$PORT
-SERVER_ADDR=$ADDR
+SERVER_ADDR=$SERVER_ADDR
 EXPIRE_EPOCH=$EXP
+REALITY_DEST=$REALITY_DEST
+REALITY_SNI=$REALITY_SNI
+SHORT_ID=$SHORT_ID
 M
 
+UNIT="/etc/systemd/system/${TAG}.service"
 cat >"$UNIT" <<U
 [Unit]
-Description=Temp HY2 $TAG
+Description=Temp VLESS $TAG
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/hy2_run_temp.sh $TAG $CFG2
-ExecStopPost=/usr/local/sbin/hy2_cleanup_one.sh $TAG
+ExecStart=/usr/local/sbin/vless_run_temp.sh $TAG $CFG
+ExecStopPost=/usr/local/sbin/vless_cleanup_one.sh $TAG
 Restart=no
 
 [Install]
@@ -678,40 +559,47 @@ U
 
 systemctl daemon-reload
 
-# 先 enable（失败不会让整个脚本崩）
 if ! systemctl enable "$TAG".service >/dev/null 2>&1; then
   echo "⚠️ 无法 enable $TAG.service（可以稍后手动 systemctl enable $TAG.service）"
 fi
 
-# 再 start，如失败则回滚清理
 if ! systemctl start "$TAG".service; then
-  echo "❌ 启动临时 Hy2 服务失败，正在回滚..."
-  FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  echo "❌ 启动临时 VLESS 服务失败，正在回滚..."
+  FORCE=1 /usr/local/sbin/vless_cleanup_one.sh "$TAG" || true
   exit 1
 fi
 
 E_STR=$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')
-echo "✅ 新节点: $TAG
-地址: $ADDR:$PORT/UDP
-密码: $PASS
-有效期: $D 秒
-到期: $E_STR
-URL:
-hysteria2://$PASS@$ADDR:$PORT/?sni=$ADDR&insecure=1#$TAG"
+
+PBK_PARAM=""
+if [[ -n "$PBK" ]]; then
+  PBK_PARAM="&pbk=${PBK}"
+fi
+
+VLESS_URL="vless://${UUID}@${SERVER_ADDR}:${PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome${PBK_PARAM}&sid=${SHORT_ID}#${TAG}"
+
+echo "✅ 新 VLESS 临时节点: $TAG
+地址: ${SERVER_ADDR}:${PORT}
+UUID: ${UUID}
+有效期: ${D} 秒
+到期(北京时间): ${E_STR}
+VLESS 订阅链接:
+${VLESS_URL}"
 MK
-chmod +x /usr/local/sbin/hy2_mktemp.sh
+chmod +x /usr/local/sbin/vless_mktemp.sh
 
 ########################################
-# 4) 强力 GC：按 meta 过期时间清理
+# 4) GC：按 meta 过期时间清理
 ########################################
-cat >/usr/local/sbin/hy2_gc.sh << 'GC'
+cat >/usr/local/sbin/vless_gc.sh << 'GC'
 #!/usr/bin/env bash
 set -euo pipefail
 shopt -s nullglob
 
+XRAY_DIR="/usr/local/etc/xray"
 NOW=$(date +%s)
 
-for META in /etc/hysteria/hy2-temp-*.meta; do
+for META in "$XRAY_DIR"/vless-temp-*.meta; do
   unset TAG EXPIRE_EPOCH
   . "$META" 2>/dev/null || continue
 
@@ -723,25 +611,25 @@ for META in /etc/hysteria/hy2-temp-*.meta; do
   fi
 
   if (( EXPIRE_EPOCH <= NOW )); then
-    /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+    /usr/local/sbin/vless_cleanup_one.sh "$TAG" || true
   fi
 done
 GC
-chmod +x /usr/local/sbin/hy2_gc.sh
+chmod +x /usr/local/sbin/vless_gc.sh
 
-cat >/etc/systemd/system/hy2-gc.service << 'GCSVC'
+cat >/etc/systemd/system/vless-gc.service << 'GCSVC'
 [Unit]
-Description=HY2 Temp Nodes Garbage Collector
+Description=VLESS Temp Nodes Garbage Collector
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/hy2_gc.sh
+ExecStart=/usr/local/sbin/vless_gc.sh
 GCSVC
 
-cat >/etc/systemd/system/hy2-gc.timer << 'GCTMR'
+cat >/etc/systemd/system/vless-gc.timer << 'GCTMR'
 [Unit]
-Description=Run HY2 GC every 15 minutes
+Description=Run VLESS GC every 15 minutes
 
 [Timer]
 OnBootSec=5min
@@ -753,18 +641,18 @@ WantedBy=timers.target
 GCTMR
 
 systemctl daemon-reload
-systemctl enable --now hy2-gc.timer || true
+systemctl enable --now vless-gc.timer || true
 
 ########################################
-# 5) 审计脚本（主服务 + 临时节点）
+# 5) 审计脚本（主 VLESS + 临时 VLESS）
 ########################################
-cat >/usr/local/sbin/hy2_audit.sh << 'AUDIT'
+cat >/usr/local/sbin/vless_audit.sh << 'AUDIT'
 #!/usr/bin/env bash
 set -euo pipefail
 shopt -s nullglob
 
 MAIN_VLESS="${MAIN_VLESS:-xray.service}"
-MAIN_HY2="${MAIN_HY2:-hysteria-server.service}"
+XRAY_DIR="/usr/local/etc/xray"
 
 printf "%-40s %-10s %-6s %-12s %-10s %-20s\n" "NAME" "STATE" "PORT" "LEFT" "NOTE" "EXPIRE(China)"
 
@@ -780,10 +668,11 @@ print_main() {
   fi
 }
 
+# 主 VLESS Reality（端口 443）
 print_main "$MAIN_VLESS" "443" "vless-main"
-print_main "$MAIN_HY2"  "8443" "hy2-main"
 
-for META in /etc/hysteria/hy2-temp-*.meta; do
+# 所有临时 VLESS 节点
+for META in "$XRAY_DIR"/vless-temp-*.meta; do
   unset TAG PORT EXPIRE_EPOCH
   . "$META" 2>/dev/null || continue
 
@@ -812,25 +701,27 @@ for META in /etc/hysteria/hy2-temp-*.meta; do
     EXPIRE_AT_FMT="N/A"
   fi
 
-  printf "%-40s %-10s %-6s %-12s %-10s %-20s\n" "$NAME" "$STATE" "$PORT_STR" "$LEFT_STR" "hy2-temp" "$EXPIRE_AT_FMT"
+  printf "%-40s %-10s %-6s %-12s %-10s %-20s\n" "$NAME" "$STATE" "$PORT_STR" "$LEFT_STR" "vless-temp" "$EXPIRE_AT_FMT"
 done
 AUDIT
-chmod +x /usr/local/sbin/hy2_audit.sh
+chmod +x /usr/local/sbin/vless_audit.sh
 
 ########################################
-# 6) 清空全部临时节点（强制）
+# 6) 清空全部临时 VLESS 节点（强制）
 ########################################
-cat >/usr/local/sbin/hy2_clear_all.sh << 'CLR'
+cat >/usr/local/sbin/vless_clear_all.sh << 'CLR'
 #!/usr/bin/env bash
 set -euo pipefail
 shopt -s nullglob
 
-echo "== HY2 临时节点批量清理开始 =="
+XRAY_DIR="/usr/local/etc/xray"
 
-META_FILES=(/etc/hysteria/hy2-temp-*.meta)
+echo "== VLESS 临时节点批量清理开始 =="
+
+META_FILES=("$XRAY_DIR"/vless-temp-*.meta)
 
 if (( ${#META_FILES[@]} == 0 )); then
-  echo "当前没有任何临时 HY2 节点。"
+  echo "当前没有任何临时 VLESS 节点。"
   exit 0
 fi
 
@@ -845,52 +736,52 @@ for META in "${META_FILES[@]}"; do
   fi
 
   echo "  -> 清理 ${TAG}"
-  FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  FORCE=1 /usr/local/sbin/vless_cleanup_one.sh "$TAG" || true
 done
 
 systemctl daemon-reload >/dev/null 2>&1 || true
-echo "✅ 所有临时 HY2 节点清理流程已执行完毕。"
+echo "✅ 所有临时 VLESS 节点清理流程已执行完毕。"
 CLR
-chmod +x /usr/local/sbin/hy2_clear_all.sh
+chmod +x /usr/local/sbin/vless_clear_all.sh
 
-echo "✅ Hy2 临时节点 + 审计 + GC 脚本部署/覆盖完成（绝对时间 TTL）。"
+echo "✅ VLESS 临时节点 + 审计 + GC 脚本部署/覆盖完成（绝对时间 TTL）。"
 
 cat <<USE
 
-============ 使用方法（Hy2 临时节点 / 审计） ============
+============ 使用方法（VLESS 临时节点 / 审计） ============
 
-1) 新建一个临时节点（例如 600 秒）：
-   D=600 hy2_mktemp.sh
+1) 新建一个临时 VLESS 节点（例如 600 秒）：
+   D=600 vless_mktemp.sh
 
    - 创建时记录 EXPIRE_EPOCH = 创建瞬间 + D 秒
    - 之后每次重启都会按 EXPIRE_EPOCH 计算剩余 TTL
 
-2) 查看主节点 + 所有临时节点状态（按绝对时间计算剩余）：
-   hy2_audit.sh
+2) 查看主 VLESS + 所有临时节点状态（按绝对时间计算剩余）：
+   vless_audit.sh
 
 3) 正常情况下：
-   - hy2_run_temp.sh 使用 timeout(剩余秒数) 控制节点寿命
-   - 进程退出后 ExecStopPost -> hy2_cleanup_one.sh 清理已过期节点
-   - hy2_gc.timer 作为兜底，定时扫描 EXPIRE_EPOCH 过期节点
+   - vless_run_temp.sh 使用 timeout(剩余秒数) 控制节点寿命
+   - 进程退出后 ExecStopPost -> vless_cleanup_one.sh 清理已过期节点
+   - vless-gc.timer 作为兜底，定时扫描 EXPIRE_EPOCH 过期节点
 
 4) 手动强制清空所有临时节点（无视是否过期）：
-   hy2_clear_all.sh
+   vless_clear_all.sh
 
 5) 强制干掉某一个未过期节点示例：
-   FORCE=1 hy2_cleanup_one.sh hy2-temp-YYYYMMDDHHMMSS-ABCD
+   FORCE=1 vless_cleanup_one.sh vless-temp-YYYYMMDDHHMMSS-ABCD
 
 ==========================================================
 USE
 
 EOF
 
-  chmod +x /root/hy2_temp_audit_ipv4_all.sh
+  chmod +x /root/vless_temp_audit_ipv4_all.sh
 }
 
-# ------------------ 5. nftables 配额系统（1 分钟保存 counters） ------------------
+# ------------------ 4. nftables 配额系统（TCP 上行，适配 VLESS） ------------------
 
 install_port_quota() {
-  echo "🧩 部署 UDP 上行配额系统（nftables）..."
+  echo "🧩 部署 TCP 上行配额系统（nftables，适配 VLESS 端口）..."
   apt-get update -y >/dev/null || true
   apt-get install -y nftables >/dev/null || true
   mkdir -p /etc/portquota
@@ -917,16 +808,17 @@ if ! [[ "$GIB" =~ ^[0-9]+$ ]]; then
 fi
 BYTES=$((GIB * 1024 * 1024 * 1024))
 
+# 先删掉已有规则
 nft -a list chain inet portquota down_out 2>/dev/null | \
- awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
+ awk -v p="$PORT" '$0 ~ "tcp sport "p" " {print $NF}' | while read -r h; do
    nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
  done
 
 nft delete counter inet portquota "pq_down_$PORT" 2>/dev/null || true
 nft add counter inet portquota "pq_down_$PORT"
-nft add rule inet portquota down_out udp sport "$PORT" \
+nft add rule inet portquota down_out tcp sport "$PORT" \
   counter name "pq_down_$PORT" quota over "$BYTES" bytes drop comment "pq-quota-$PORT"
-nft add rule inet portquota down_out udp sport "$PORT" \
+nft add rule inet portquota down_out tcp sport "$PORT" \
   counter name "pq_down_$PORT" comment "pq-track-$PORT"
 
 cat >/etc/portquota/pq-"$PORT".meta <<M
@@ -940,7 +832,7 @@ M
 nft list ruleset > /etc/nftables.conf
 systemctl enable --now nftables >/dev/null 2>&1 || true
 
-echo "✅ 已为端口 $PORT 设置限额 ${GIB}GiB（本机 UDP 上行）"
+echo "✅ 已为端口 $PORT 设置限额 ${GIB}GiB（本机 TCP 上行，对应 VLESS 端口）"
 ADD
   chmod +x /usr/local/sbin/pq_add.sh
 
@@ -951,7 +843,7 @@ PORT="${1:-}"
 if [[ -z "$PORT" ]]; then echo "用法: pq_del.sh <端口>" >&2; exit 1; fi
 
 nft -a list chain inet portquota down_out 2>/dev/null | \
- awk -v p="$PORT" '$0 ~ "udp sport "p" " {print $NF}' | while read -r h; do
+ awk -v p="$PORT" '$0 ~ "tcp sport "p" " {print $NF}' | while read -r h; do
    nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
  done
 
@@ -967,7 +859,7 @@ DEL
 
   cat >/usr/local/sbin/pq_audit.sh <<'AUDIT'
 #!/usr/bin/env bash
-# 🔍 实时审计 nft quota（上行统计）
+# 🔍 实时审计 nft quota（TCP 上行统计，适配 VLESS 端口）
 set -e; shopt -s nullglob
 printf "%-8s %-8s %-12s %-12s %-8s %-10s\n" \
  "PORT" "STATE" "USED(GiB)" "LIMIT(GiB)" "PERCENT" "MODE"
@@ -977,7 +869,7 @@ for META in /etc/portquota/pq-*.meta; do
   PORT="${PORT:-}"; [[ -z "$PORT" ]] && continue
   LIMIT_BYTES="${LIMIT_BYTES:-0}"; MODE="${MODE:-quota}"
   QUOTA_LINE="$(nft -a list chain inet portquota down_out 2>/dev/null \
-    | awk -v p="$PORT" '$0~"udp sport "p" "&&$0~"pq-quota-"p{print;exit}')"
+    | awk -v p="$PORT" '$0~"tcp sport "p" "&&$0~"pq-quota-"p{print;exit}')"
   CUR=""; QUOTA_LIMIT_BYTES=""
   if [[ -n "$QUOTA_LINE" ]]; then
     CUR="$(awk '{for(i=1;i<=NF;i++)if($i=="used"){print $(i+1);exit}}'<<<"$QUOTA_LINE")"
@@ -1060,9 +952,12 @@ PQTMR
 
   cat <<USE
 
-============ 使用方法（UDP 上行配额 / 审计） ============
+============ 使用方法（TCP 上行配额 / 审计，建议用于 VLESS 端口） ============
 
-1) 为端口添加配额（例如限制 40000 端口 50GiB）：
+1) 为端口添加配额（例如限制 443 端口 500GiB，上行）：
+   pq_add.sh 443 500
+
+   # 临时 VLESS 节点端口（例如 40000）：
    pq_add.sh 40000 50
 
 2) 查看所有端口使用情况：
@@ -1072,7 +967,8 @@ PQTMR
    pq_del.sh 40000
 
 说明：
-- 统计的是本机发出的 UDP 上行流量（chain: output, udp sport）
+- 统计的是本机发出的 TCP 上行流量（chain: output, tcp sport）
+- 适合对 VLESS Reality 监听端口（443 / 临时端口）做上行限额
 - 每次 add/del 会立即保存 nft 规则到 /etc/nftables.conf
 - 额外有 pq-save.timer 每 1 分钟自动保存快照，
   重启后会从最近快照恢复，已使用量最多丢失约 1 分钟内的统计
@@ -1090,8 +986,7 @@ main() {
 
   install_update_all
   install_vless_script
-  install_hy2_script
-  install_hy2_temp_audit
+  install_vless_temp_audit
   install_port_quota
 
   cat <<'DONE'
@@ -1105,30 +1000,28 @@ main() {
    update-all
    reboot
 
-2) VLESS Reality (IPv4, SNI=www.apple.com)：
+2) VLESS Reality (IPv4, SNI=www.apple.com) 主节点：
    bash /root/onekey_reality_ipv4.sh
 
-3) Hysteria2 官方极简 + Clash 订阅：
-   bash /root/hy2_official_minimal_ipv4.sh
-
-4) Hy2 临时节点 + 审计 + GC（绝对时间 TTL）：
-   bash /root/hy2_temp_audit_ipv4_all.sh
+3) VLESS 临时节点 + 审计 + GC（绝对时间 TTL）：
+   bash /root/vless_temp_audit_ipv4_all.sh
    # 部署后：
-   D=600 hy2_mktemp.sh     # 新建 600 秒临时节点（按绝对时间生效）
-   hy2_audit.sh            # 查看全部节点状态（剩余时间按 EXPIRE_EPOCH 计算）
-   hy2_clear_all.sh        # 手动强制清空所有临时节点
+   D=600 vless_mktemp.sh     # 新建 600 秒 VLESS 临时节点
+   vless_audit.sh            # 查看主节点 + 全部临时节点状态
+   vless_clear_all.sh        # 手动强制清空所有 VLESS 临时节点
 
-5) UDP 上行配额（nftables + 1 分钟保存 counters）：
-   pq_add.sh 40000 50      # 端口 40000 限制 50GiB 上行
-   pq_audit.sh             # 查看所有端口配额使用
-   pq_del.sh 40000         # 删除 40000 端口配额
+4) TCP 上行配额（nftables + 1 分钟保存 counters，对应 VLESS 端口）：
+   pq_add.sh 443 500         # 443 端口限制 500GiB 上行
+   pq_add.sh 40000 50        # 临时 VLESS 端口 40000 限制 50GiB 上行
+   pq_audit.sh               # 查看所有端口配额使用
+   pq_del.sh 40000           # 删除 40000 端口配额
 
 所有 SNI/伪装域名已统一为： www.apple.com
 
 🎯 建议顺序：
    1) update-all && reboot
-   2) 跑 VLESS / Hy2 两个一键脚本
-   3) 需要临时节点就跑 hy2_temp_audit_ipv4_all.sh 再 D=xxx hy2_mktemp.sh
+   2) 跑 VLESS 一键脚本（主节点）
+   3) 需要临时节点就跑 vless_temp_audit_ipv4_all.sh 再 D=xxx vless_mktemp.sh
    4) 需要限额就用 pq_add.sh / pq_audit.sh / pq_del.sh
 
 ==================================================
