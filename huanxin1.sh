@@ -4,7 +4,7 @@ set -euo pipefail
 # Debian 12 一键生成脚本（稳定增强版：省CPU + 稳定优先）
 # 已包含修复/增强：
 # 1) need_basic_tools: apt-get update 不吞错
-# 2) Xray outbounds 默认出口顺序：direct 第一，api 最后（避免默认出口跑偏）
+# 2) Xray outbounds 默认出口顺序：direct 第一（避免默认出口跑偏）
 # 3) pq_add/pq_del 端口校验
 # 4) systemd-run TTL 失败不再静默吞掉 + 检查/提示 vless-gc.timer（必要时尝试启用）
 # 5) /tmp 临时文件 mktemp 权限与清理
@@ -12,7 +12,8 @@ set -euo pipefail
 # 7) 配置统一化：写入 /usr/local/etc/xray/env.conf，子脚本统一读取（API_PORT 不再硬编码漂移）
 # 8) 端口分配：最小使用数 + 随机打散（避免热点偏向第一个端口）
 # 9) ✅ 锁重入最终修复：vless_rmu_one.sh 只判断 fd9 是否存在来复用锁（避免 /var/lock -> /run/lock symlink 误判）
-# 10) ✅ 公网 IP 检测修复：detect_ipv4_public_first 写在前面 + 检测失败可手动输入 IP
+# 10) ✅ Xray api 配置修复：不再生成 protocol="api" 的 outbound，避免 unknown config id: api
+# 11) ✅ x25519 输出兼容新版：PublicKey/Public key/Password 都能正确取到公钥
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
@@ -105,7 +106,7 @@ EOF
 }
 
 install_vless_script_singleproc_40ports() {
-  echo "🧩 写入 /root/onekey_reality_ipv4.sh（含 env.conf + outbounds 顺序修复）..."
+  echo "🧩 写入 /root/onekey_reality_ipv4.sh（含 env.conf + 修复后的 api 配置）..."
 
   cat >/root/onekey_reality_ipv4.sh <<'EOF'
 #!/usr/bin/env bash
@@ -148,28 +149,21 @@ is_private_ip() {
   return 1
 }
 
-# ==== 公网 IPv4 自动探测（修正版，兼容性好）====
 detect_ipv4_public_first() {
   local ip=""
 
-  # 1) 先尝试从外网服务拿 IP
-  ip="$(curl -4fsS --connect-timeout 2 --max-time 6 \
-      --retry 2 --retry-delay 1 --retry-all-errors \
-      https://api.ipify.org || true)"
-  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+  ip="$(curl -4fsS --connect-timeout 2 --max-time 6 --retry 2 --retry-delay 1 --retry-all-errors https://api.ipify.org || true)"
+  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
     echo "$ip"; return 0
   fi
 
-  # 2) 再尝试从路由表里拿出网 IP
-  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | \
-      awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
     echo "$ip"; return 0
   fi
 
-  # 3) 最后尝试 hostname -I
   ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
     echo "$ip"; return 0
   fi
 
@@ -184,57 +178,57 @@ check_port_free_443() {
   fi
 }
 
-check_debian12
+main() {
+  check_debian12
 
-# —— 核心配置（会写入 env.conf 供其它脚本复用）——
-REALITY_DOMAIN="www.apple.com"
-MAIN_PORT=443
-MAIN_TAG="vless-main"
+  # —— 核心配置（会写入 env.conf 供其它脚本复用）——
+  REALITY_DOMAIN="www.apple.com"
+  MAIN_PORT=443
+  MAIN_TAG="vless-main"
 
-API_HOST="127.0.0.1"
-API_PORT=10085
-API_TAG="api"
+  API_HOST="127.0.0.1"
+  API_PORT=10085
+  API_TAG="api"
 
-SERVER_IP="$(detect_ipv4_public_first)"
-if [ -z "$SERVER_IP" ]; then
-  read -rp "❗ 自动检测公网 IPv4 失败，请手动输入服务器公网 IP: " SERVER_IP
-fi
-if [ -z "$SERVER_IP" ]; then
-  echo "❌ 仍然没有拿到公网 IPv4，退出。"
-  exit 1
-fi
+  SERVER_IP="$(detect_ipv4_public_first)"
+  [ -n "$SERVER_IP" ] || { echo "❌ 无法检测公网 IPv4（或拿到的是内网 IP）"; exit 1; }
 
-check_port_free_443
+  check_port_free_443
 
-echo "=== 1) 只开启 fq + bbr（其余 sysctl 保持默认）==="
-cat >/etc/sysctl.d/99-bbr.conf <<'SYS'
+  echo "=== 1) 只开启 fq + bbr（其余 sysctl 保持默认）==="
+  cat >/etc/sysctl.d/99-bbr.conf <<'SYS'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 SYS
-modprobe tcp_bbr 2>/dev/null || true
-sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
-echo "当前: qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown), cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  modprobe tcp_bbr 2>/dev/null || true
+  sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
+  echo "当前: qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown), cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
 
-echo "=== 2) 安装/更新 xray ==="
-install_xray
-systemctl stop xray 2>/dev/null || true
+  echo "=== 2) 安装/更新 xray ==="
+  install_xray
+  systemctl stop xray 2>/dev/null || true
 
-echo "=== 3) UUID + Reality 密钥 ==="
-UUID="$(/usr/local/bin/xray uuid)"
+  echo "=== 3) UUID + Reality 密钥 ==="
+  XRAY_BIN="/usr/local/bin/xray"
+  UUID="$("$XRAY_BIN" uuid)"
 
-KEY_OUT="$(/usr/local/bin/xray x25519)"
-PRIVATE_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PrivateKey:/ {print $2;exit} /^Private key:/ {print $3;exit}')"
-PUBLIC_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PublicKey:/ {print $2;exit} /^Public key:/ {print $3;exit} /^Password:/ {print $2;exit}')"
-[ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || { echo "❌ Reality key 解析失败"; echo "$KEY_OUT"; exit 1; }
+  KEY_OUT="$("$XRAY_BIN" x25519)"
+  PRIVATE_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PrivateKey:/ {print $2;exit} /^Private key:/ {print $3;exit}')"
+  PUBLIC_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PublicKey:/ {print $2;exit} /^Public key:/ {print $3;exit} /^Password:/ {print $2;exit}')"
+  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo "❌ Reality key 解析失败，原始输出："
+    printf '%s\n' "$KEY_OUT"
+    exit 1
+  fi
 
-SHORT_ID="$(openssl rand -hex 8)"
+  SHORT_ID="$(openssl rand -hex 8)"
 
-CFG_DIR=/usr/local/etc/xray
-mkdir -p "$CFG_DIR"
+  CFG_DIR=/usr/local/etc/xray
+  mkdir -p "$CFG_DIR"
 
-# ✅ 统一配置文件：子脚本统一读取，避免 API_PORT/端口段硬编码漂移
-ENV_CONF="${CFG_DIR}/env.conf"
-cat >"$ENV_CONF" <<CONFENV
+  # ✅ 统一配置文件：子脚本统一读取，避免 API_PORT/端口段硬编码漂移
+  ENV_CONF="${CFG_DIR}/env.conf"
+  cat >"$ENV_CONF" <<CONFENV
 REALITY_DOMAIN=${REALITY_DOMAIN}
 MAIN_PORT=${MAIN_PORT}
 API_HOST=${API_HOST}
@@ -242,14 +236,14 @@ API_PORT=${API_PORT}
 TEMP_PORT_START=${TEMP_PORT_START}
 TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
 CONFENV
-chmod 600 "$ENV_CONF" 2>/dev/null || true
+  chmod 600 "$ENV_CONF" 2>/dev/null || true
 
-TMP_INBOUNDS=""
-for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
-  p=$((TEMP_PORT_START+i))
-  tag="vless-tmp-$p"
-  TMP_INBOUNDS+=$(cat <<JSON
-    ,
+  TMP_INBOUNDS=""
+  for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
+    p=$((TEMP_PORT_START+i))
+    tag="vless-tmp-$p"
+    TMP_INBOUNDS+=$(cat <<JSON
+,
     {
       "tag": "${tag}",
       "listen": "0.0.0.0",
@@ -274,12 +268,23 @@ for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
     }
 JSON
 )
-done
+  done
 
-cat >"$CFG_DIR/config.json" <<CONF
+  cat >"$CFG_DIR/config.json" <<CONF
 {
-  "api": { "tag": "${API_TAG}", "services": ["HandlerService"] },
-  "log": { "loglevel": "warning" },
+  "log": {
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "${API_TAG}",
+    "services": [
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ]
+  },
+  "stats": {},
   "inbounds": [
     {
       "tag": "${MAIN_TAG}",
@@ -304,7 +309,7 @@ cat >"$CFG_DIR/config.json" <<CONF
           "shortIds": [ "${SHORT_ID}" ]
         }
       }
-    }${TMP_INBOUNDS}
+    ${TMP_INBOUNDS}
     ,
     {
       "tag": "${API_TAG}",
@@ -316,19 +321,22 @@ cat >"$CFG_DIR/config.json" <<CONF
   ],
   "routing": {
     "rules": [
-      { "type": "field", "inboundTag": ["${API_TAG}"], "outboundTag": "${API_TAG}" }
+      {
+        "type": "field",
+        "inboundTag": [ "${API_TAG}" ],
+        "outboundTag": "${API_TAG}"
+      }
     ]
   },
   "outbounds": [
     { "tag": "direct", "protocol": "freedom" },
-    { "tag": "block",  "protocol": "blackhole" },
-    { "tag": "${API_TAG}", "protocol": "api" }
+    { "tag": "block",  "protocol": "blackhole" }
   ]
 }
 CONF
 
-mkdir -p /etc/systemd/system/xray.service.d
-cat >/etc/systemd/system/xray.service.d/override.conf <<'OVR'
+  mkdir -p /etc/systemd/system/xray.service.d
+  cat >/etc/systemd/system/xray.service.d/override.conf <<'OVR'
 [Service]
 LimitNOFILE=1048576
 Nice=-5
@@ -336,34 +344,38 @@ Restart=on-failure
 RestartSec=1
 OVR
 
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+  # 先测试配置
+  "$XRAY_BIN" run -test -config /usr/local/etc/xray/config.json
 
-systemctl daemon-reload
-systemctl enable xray >/dev/null 2>&1 || true
-systemctl restart xray
+  systemctl daemon-reload
+  systemctl enable xray >/dev/null 2>&1 || true
+  systemctl restart xray
 
-sleep 1
-if ! systemctl is-active --quiet xray.service; then
-  echo "❌ xray.service 启动失败："
-  systemctl status xray.service --no-pager || true
-  journalctl -u xray.service -n 80 --no-pager || true
-  exit 1
-fi
+  sleep 1
+  if ! systemctl is-active --quiet xray.service; then
+    echo "❌ xray.service 启动失败："
+    systemctl status xray.service --no-pager || true
+    journalctl -u xray.service -n 80 --no-pager || true
+    exit 1
+  fi
 
-NODE_NAME="VLESS-REALITY-IPv4-APPLE"
-VLESS_URL="vless://${UUID}@${SERVER_IP}:${MAIN_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${NODE_NAME}"
+  NODE_NAME="VLESS-REALITY-IPv4-APPLE"
+  VLESS_URL="vless://${UUID}@${SERVER_IP}:${MAIN_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${NODE_NAME}"
 
-echo "$VLESS_URL" >/root/vless_reality_vision_url.txt
-if base64 --help 2>/dev/null | grep -q -- "-w"; then
-  echo "$VLESS_URL" | base64 -w0 >/root/v2ray_subscription_base64.txt
-else
-  echo "$VLESS_URL" | base64 | tr -d '\n' >/root/v2ray_subscription_base64.txt
-fi
+  echo "$VLESS_URL" >/root/vless_reality_vision_url.txt
+  if base64 --help 2>/dev/null | grep -q -- "-w"; then
+    echo "$VLESS_URL" | base64 -w0 >/root/v2ray_subscription_base64.txt
+  else
+    echo "$VLESS_URL" | base64 | tr -d '\n' >/root/v2ray_subscription_base64.txt
+  fi
 
-echo "✅ 主节点完成：443 + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
-echo "统一配置文件：${ENV_CONF}"
-echo "主节点链接："
-cat /root/vless_reality_vision_url.txt
+  echo "✅ 主节点完成：443 + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
+  echo "统一配置文件：${ENV_CONF}"
+  echo "主节点链接："
+  cat /root/vless_reality_vision_url.txt
+}
+
+main "$@"
 EOF
 
   chmod +x /root/onekey_reality_ipv4.sh
@@ -427,7 +439,6 @@ XRAY_BIN="/usr/local/bin/xray"
 DIR="/usr/local/etc/xray/tmpusers"
 LOCK="/var/lock/vless-tmpusers.lock"
 
-# 统一读取 API_HOST/API_PORT
 if [[ -x /usr/local/sbin/vless_load_env.sh ]]; then
   /usr/local/sbin/vless_load_env.sh
   API_SERVER="${API_SERVER:-127.0.0.1:10085}"
@@ -435,9 +446,6 @@ else
   API_SERVER="127.0.0.1:10085"
 fi
 
-# ✅ 核心修复：
-# 如果 fd 9 已经存在（通常来自父进程 vless_gc / vless_clear_all 的继承），就直接复用现有 fd 9；
-# 否则自己 open fd 9。
 if [[ -e "/proc/$$/fd/9" ]]; then
   :
 else
@@ -801,7 +809,7 @@ EOF
 
 install_port_quota_hard_10min() {
   echo "🧩 部署 TCP 上行配额系统（硬配额：超量立即 drop；10 分钟保存快照；保存带 flush ruleset）..."
-  apt-get install -y nftables >/dev/null || true
+  apt-get install -y nftables >/dev/null 2>&1 || true
   mkdir -p /etc/portquota
 
   nft list table inet portquota >/dev/null 2>&1 || nft add table inet portquota
@@ -985,7 +993,7 @@ main() {
 
 建议顺序：
 1) update-all && reboot
-2) bash /root/onekey_reality_ipv4.sh     （写 /usr/local/etc/xray/env.conf）
+2) bash /root/onekey_reality_ipv4.sh     （写 /usr/local/etc/xray/env.conf + 主节点）
 3) bash /root/vless_temp_audit_ipv4_all.sh
 
 常用命令：
