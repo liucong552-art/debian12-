@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # Debian 12 一键生成脚本（稳定增强版：省CPU + 稳定优先）
-# 本版修复/增强：
-# 1) onekey_reality_ipv4.sh 变量定义顺序（set -u 不炸）
-# 2) Xray API outbound 缺失（adu/rmu 真可用）+ outbounds 默认出口顺序修复（direct 第一）
+# 已包含修复/增强：
+# 1) need_basic_tools: apt-get update 不再吞错
+# 2) Xray outbounds 默认出口顺序：direct 第一，api 最后（避免默认出口跑偏）
 # 3) pq_add/pq_del 端口校验
-# 4) systemd-run TTL 失败不再静默吞掉
-# 5) /tmp 临时文件权限与清理
-# 6) need_basic_tools 的 apt-get update 不再吞错
-# 7) pq_audit.sh 在 counter 缺失时不再直接退出
-# 8) TEMP_PORT_START/COUNT 不再多处硬编码：统一写入 /usr/local/etc/xray/ports.env 并由 vless_mktemp.sh 读取
+# 4) systemd-run TTL 失败不再静默吞掉 + 检查/提示 vless-gc.timer 状态（必要时尝试启用）
+# 5) /tmp 临时文件 mktemp 权限与清理
+# 6) pq_audit.sh：counter 缺失不再触发 set -e 退出
+# 7) 配置统一化：写入 /usr/local/etc/xray/env.conf，子脚本统一读取（API_PORT 不再硬编码漂移）
+# 8) 端口分配：最小使用数 + 随机打散（避免热点偏向第一个端口）
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
@@ -33,8 +33,7 @@ check_debian12() {
 
 need_basic_tools() {
   export DEBIAN_FRONTEND=noninteractive
-
-  # ✅ 修复：update 失败就退出，不再吞掉失败继续跑
+  # ✅ 修复：update 失败就退出，不再吞错继续跑
   apt-get update -y || apt-get update -y || { echo "❌ apt-get update 失败"; exit 1; }
 
   apt-get install -y \
@@ -105,7 +104,7 @@ EOF
 }
 
 install_vless_script_singleproc_40ports() {
-  echo "🧩 写入 /root/onekey_reality_ipv4.sh（修复变量顺序 + 修复 API outbound + outbounds 顺序）..."
+  echo "🧩 写入 /root/onekey_reality_ipv4.sh（含 env.conf + outbounds 顺序修复）..."
 
   cat >/root/onekey_reality_ipv4.sh <<'EOF'
 #!/usr/bin/env bash
@@ -175,6 +174,7 @@ check_port_free_443() {
 
 check_debian12
 
+# —— 核心配置（会写入 env.conf 供其它脚本复用）——
 REALITY_DOMAIN="www.apple.com"
 MAIN_PORT=443
 MAIN_TAG="vless-main"
@@ -214,13 +214,17 @@ SHORT_ID="$(openssl rand -hex 8)"
 CFG_DIR=/usr/local/etc/xray
 mkdir -p "$CFG_DIR"
 
-# ✅ 统一端口范围配置：供 vless_mktemp.sh 读取，避免硬编码错配
-PORTS_ENV="${CFG_DIR}/ports.env"
-cat >"$PORTS_ENV" <<PE
+# ✅ 统一配置文件：子脚本统一读取，避免 API_PORT/端口段硬编码漂移
+ENV_CONF="${CFG_DIR}/env.conf"
+cat >"$ENV_CONF" <<CONFENV
+REALITY_DOMAIN=${REALITY_DOMAIN}
+MAIN_PORT=${MAIN_PORT}
+API_HOST=${API_HOST}
+API_PORT=${API_PORT}
 TEMP_PORT_START=${TEMP_PORT_START}
 TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
-PE
-chmod 600 "$PORTS_ENV" 2>/dev/null || true
+CONFENV
+chmod 600 "$ENV_CONF" 2>/dev/null || true
 
 TMP_INBOUNDS=""
 for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
@@ -339,7 +343,7 @@ else
 fi
 
 echo "✅ 主节点完成：443 + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
-echo "端口范围配置已写入：${PORTS_ENV}"
+echo "统一配置文件：${ENV_CONF}"
 echo "主节点链接："
 cat /root/vless_reality_vision_url.txt
 EOF
@@ -348,14 +352,14 @@ EOF
 }
 
 install_temp_users_40ports() {
-  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（TTL提示 + /tmp 改 mktemp 权限 + 端口范围统一读取）..."
+  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（API/端口段统一读 env.conf + TTL失败检查timer + 端口分配随机打散）..."
 
   cat >/root/vless_temp_audit_ipv4_all.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 XRAY_BIN="/usr/local/bin/xray"
-API_SERVER="127.0.0.1:10085"
+ENV_CONF="/usr/local/etc/xray/env.conf"
 
 DIR="/usr/local/etc/xray/tmpusers"
 LOG_USER="/var/log/vless-user.log"
@@ -367,6 +371,37 @@ mkdir -p "$DIR"
 touch "$LOG_USER" "$LOG_GC" "$LOG_RS" 2>/dev/null || true
 chmod 700 "$DIR" || true
 
+# ---- helper: load env ----
+cat >/usr/local/sbin/vless_load_env.sh <<'LEN'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_CONF="/usr/local/etc/xray/env.conf"
+
+# defaults
+REALITY_DOMAIN="${REALITY_DOMAIN:-www.apple.com}"
+MAIN_PORT="${MAIN_PORT:-443}"
+API_HOST="${API_HOST:-127.0.0.1}"
+API_PORT="${API_PORT:-10085}"
+TEMP_PORT_START="${TEMP_PORT_START:-40000}"
+TEMP_PORT_COUNT="${TEMP_PORT_COUNT:-40}"
+
+if [[ -f "$ENV_CONF" ]]; then
+  # shellcheck disable=SC1090
+  . "$ENV_CONF" || true
+fi
+
+# basic validate
+[[ "${API_PORT}" =~ ^[0-9]+$ ]] || API_PORT=10085
+[[ "${TEMP_PORT_START}" =~ ^[0-9]+$ ]] || TEMP_PORT_START=40000
+[[ "${TEMP_PORT_COUNT}" =~ ^[0-9]+$ ]] || TEMP_PORT_COUNT=40
+(( TEMP_PORT_COUNT > 0 )) || TEMP_PORT_COUNT=40
+
+export REALITY_DOMAIN MAIN_PORT API_HOST API_PORT TEMP_PORT_START TEMP_PORT_COUNT
+export API_SERVER="${API_HOST}:${API_PORT}"
+LEN
+chmod +x /usr/local/sbin/vless_load_env.sh
+
 # ---- rmu ----
 cat >/usr/local/sbin/vless_rmu_one.sh <<'RMU'
 #!/usr/bin/env bash
@@ -374,13 +409,17 @@ set -euo pipefail
 
 EMAIL="${1:?need email}"
 INBOUND_TAG="${2:?need inbound tag}"
+
 XRAY_BIN="/usr/local/bin/xray"
-API_SERVER="127.0.0.1:10085"
 DIR="/usr/local/etc/xray/tmpusers"
 LOCK="/var/lock/vless-tmpusers.lock"
 
+# ✅ 统一读取 API_HOST/API_PORT
+/usr/local/sbin/vless_load_env.sh
+API_SERVER="${API_SERVER}"
+
 exec 9>"$LOCK"
-flock -n 9 || { echo "busy"; exit 1; }
+flock -n 9 || { echo "❌ busy"; exit 1; }
 
 "$XRAY_BIN" api rmu -s "$API_SERVER" -tag="$INBOUND_TAG" "$EMAIL" >/dev/null 2>&1 || true
 
@@ -401,10 +440,13 @@ set -euo pipefail
 : "${D:?用法: D=600 vless_mktemp.sh}"
 
 XRAY_BIN="/usr/local/bin/xray"
-API_SERVER="127.0.0.1:10085"
 DIR="/usr/local/etc/xray/tmpusers"
 LOG="/var/log/vless-user.log"
 LOCK="/var/lock/vless-tmpusers.lock"
+
+# ✅ 统一读取 API_HOST/API_PORT + 端口范围
+/usr/local/sbin/vless_load_env.sh
+API_SERVER="${API_SERVER}"
 
 exec 9>"$LOCK"
 flock -n 9 || { echo "❌ 另一个实例正在运行，请稍后重试"; exit 1; }
@@ -418,19 +460,11 @@ if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
   echo "❌ D 必须是正整数秒"; exit 1
 fi
 
-# ✅ 修复：端口范围不再硬编码，统一从 ports.env 读取（没有则用默认值兜底）
-PORTS_ENV="/usr/local/etc/xray/ports.env"
-TEMP_PORT_START=40000
-TEMP_PORT_COUNT=40
-if [[ -f "$PORTS_ENV" ]]; then
-  # shellcheck disable=SC1090
-  . "$PORTS_ENV" || true
-fi
-
-# 校验端口范围
-if ! [[ "${TEMP_PORT_START}" =~ ^[0-9]+$ ]] || ! [[ "${TEMP_PORT_COUNT}" =~ ^[0-9]+$ ]] || (( TEMP_PORT_COUNT <= 0 )); then
-  echo "❌ ports.env 端口范围无效：TEMP_PORT_START=${TEMP_PORT_START} TEMP_PORT_COUNT=${TEMP_PORT_COUNT}"
-  exit 1
+# ✅ 提前检查 GC timer，避免 TTL 失败后没人回收
+if ! systemctl is-enabled --quiet vless-gc.timer 2>/dev/null; then
+  echo "⚠️ vless-gc.timer 未启用：若 TTL unit 创建失败，过期节点可能无法自动回收。建议执行：systemctl enable --now vless-gc.timer" >&2
+elif ! systemctl is-active --quiet vless-gc.timer 2>/dev/null; then
+  echo "⚠️ vless-gc.timer 未运行：建议执行：systemctl start vless-gc.timer" >&2
 fi
 
 declare -A cnt
@@ -443,15 +477,28 @@ while IFS= read -r p; do
   [[ -n "${cnt[$p]+x}" ]] && cnt[$p]=$((cnt[$p]+1))
 done < <(awk -F= '/^PORT=/{print $2}' "$DIR"/*.meta 2>/dev/null || true)
 
-best_p=""
+# ✅ 最小使用数 + 随机打散（避免热点总落在最小端口）
 best_n=999999
 for ((i=0;i<TEMP_PORT_COUNT;i++)); do
   p=$((TEMP_PORT_START+i))
   n=${cnt[$p]}
-  if (( n < best_n )); then best_n=$n; best_p=$p; fi
+  if (( n < best_n )); then best_n=$n; fi
 done
 
-PORT="$best_p"
+cands=()
+for ((i=0;i<TEMP_PORT_COUNT;i++)); do
+  p=$((TEMP_PORT_START+i))
+  n=${cnt[$p]}
+  if (( n == best_n )); then cands+=("$p"); fi
+done
+
+if command -v shuf >/dev/null 2>&1; then
+  PORT="$(printf '%s\n' "${cands[@]}" | shuf -n1)"
+else
+  idx=$((RANDOM % ${#cands[@]}))
+  PORT="${cands[$idx]}"
+fi
+
 INBOUND_TAG="vless-tmp-$PORT"
 
 TAG="vless-temp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)"
@@ -486,7 +533,7 @@ trap 'rm -f "$TMPLOG" 2>/dev/null || true' EXIT
 
 if ! "$XRAY_BIN" api adu -s "$API_SERVER" "$CFG" >"$TMPLOG" 2>&1; then
   cat "$TMPLOG" >&2
-  echo "❌ adu 失败"
+  echo "❌ adu 失败（API_SERVER=$API_SERVER）"
   exit 1
 fi
 
@@ -508,7 +555,12 @@ fi
 
 if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${D}s" \
   /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG"; then
-  echo "⚠️ systemd-run 创建 TTL 失败：该临时节点可能不会按时自动回收（依赖 GC timer 兜底）。" >&2
+  echo "⚠️ systemd-run 创建 TTL 失败：将依赖 vless-gc.timer 兜底回收。" >&2
+  if systemctl enable --now vless-gc.timer >/dev/null 2>&1; then
+    echo "✅ 已尝试启用并启动 vless-gc.timer" >&2
+  else
+    echo "❌ 无法启用 vless-gc.timer，请手动检查 systemd/timer 环境，否则过期节点可能不回收。" >&2
+  fi
 fi
 
 MAIN="/root/vless_reality_vision_url.txt"
@@ -569,10 +621,13 @@ set -euo pipefail
 shopt -s nullglob
 
 XRAY_BIN="/usr/local/bin/xray"
-API_SERVER="127.0.0.1:10085"
 DIR="/usr/local/etc/xray/tmpusers"
 LOG="/var/log/vless-user-restore.log"
 LOCK="/var/lock/vless-tmpusers.lock"
+
+# ✅ 统一读取 API_HOST/API_PORT
+/usr/local/sbin/vless_load_env.sh
+API_SERVER="${API_SERVER}"
 
 exec 9>"$LOCK"
 flock -n 9 || exit 0
@@ -600,7 +655,8 @@ for META in "$DIR"/*.meta; do
 
       if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${REM}s" \
         /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG"; then
-        echo "⚠️ [restore] systemd-run 创建 TTL 失败：可能不会按时自动回收（依赖 GC timer）。" >&2
+        echo "⚠️ [restore] systemd-run TTL 失败：将依赖 vless-gc.timer 兜底。" >&2
+        systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
       fi
 
       echo "$(date '+%F %T %Z') [restore] $TAG rem=${REM}s" >> "$LOG" 2>/dev/null || true
@@ -656,7 +712,7 @@ DIR="/usr/local/etc/xray/tmpusers"
 LOCK="/var/lock/vless-tmpusers.lock"
 
 exec 9>"$LOCK"
-flock -n 9 || { echo "busy"; exit 1; }
+flock -n 9 || { echo "❌ busy"; exit 1; }
 
 echo "== 清空所有临时节点 =="
 for META in "$DIR"/*.meta; do
@@ -905,13 +961,13 @@ main() {
   cat <<DONE
 
 ==================================================
-✅ 已生成全部脚本（已按必要项修复）
+✅ 已生成全部脚本（含修复：API 端口不再漂移 / TTL失败检查timer / 端口分配随机打散）
 - /root/onekey_reality_ipv4.sh
 - /root/vless_temp_audit_ipv4_all.sh
 
 建议顺序：
 1) update-all && reboot
-2) bash /root/onekey_reality_ipv4.sh
+2) bash /root/onekey_reality_ipv4.sh     （会写 /usr/local/etc/xray/env.conf）
 3) bash /root/vless_temp_audit_ipv4_all.sh
 
 常用命令：
