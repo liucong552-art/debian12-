@@ -11,7 +11,7 @@ set -euo pipefail
 # 6) pq_audit.sh：counter 缺失不再触发 set -e 退出
 # 7) 配置统一化：写入 /usr/local/etc/xray/env.conf，子脚本统一读取（API_PORT 不再硬编码漂移）
 # 8) 端口分配：最小使用数 + 随机打散（避免热点偏向第一个端口）
-# 9) ✅ 修复“锁重入”问题：vless_rmu_one.sh 可复用父进程 fd=9 锁，GC/clear_all 不再假删除
+# 9) ✅ 锁重入最终修复：vless_rmu_one.sh 只判断 fd9 是否存在来复用锁（避免 /var/lock -> /run/lock symlink 误判）
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
@@ -34,7 +34,6 @@ check_debian12() {
 
 need_basic_tools() {
   export DEBIAN_FRONTEND=noninteractive
-  # ✅ 修复：update 失败就退出，不再吞错继续跑
   apt-get update -y || apt-get update -y || { echo "❌ apt-get update 失败"; exit 1; }
 
   apt-get install -y \
@@ -353,14 +352,11 @@ EOF
 }
 
 install_temp_users_40ports() {
-  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（含锁重入修复）..."
+  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（含锁重入最终修复）..."
 
   cat >/root/vless_temp_audit_ipv4_all.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-XRAY_BIN="/usr/local/bin/xray"
-ENV_CONF="/usr/local/etc/xray/env.conf"
 
 DIR="/usr/local/etc/xray/tmpusers"
 LOG_USER="/var/log/vless-user.log"
@@ -401,7 +397,7 @@ export API_SERVER="${API_HOST}:${API_PORT}"
 LEN
 chmod +x /usr/local/sbin/vless_load_env.sh
 
-# ---- rmu (✅锁重入修复版) ----
+# ---- rmu (✅锁重入最终修复版：只判断 fd9 是否存在) ----
 cat >/usr/local/sbin/vless_rmu_one.sh <<'RMU'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -422,24 +418,18 @@ else
 fi
 
 # ✅ 核心修复：
-# 如果 fd 9 已经存在且指向同一个 lock 文件（通常来自父进程 vless_gc / vless_clear_all 的继承），
-# 就不要重新 exec 9>"$LOCK"；直接 flock -n 9（会成功，不会自我冲突）。
+# 如果 fd 9 已经存在（通常来自父进程 vless_gc / vless_clear_all 的继承），就直接复用现有 fd 9；
+# 否则自己 open fd 9。
 if [[ -e "/proc/$$/fd/9" ]]; then
-  FD9_TARGET="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+  :
 else
-  FD9_TARGET=""
-fi
-
-if [[ "$FD9_TARGET" != "$LOCK" ]]; then
   exec 9>"$LOCK"
 fi
 
 flock -n 9 || { echo "❌ busy"; exit 1; }
 
-# API 删除（失败不致命：仍尝试清理本地 meta/json）
 "$XRAY_BIN" api rmu -s "$API_SERVER" -tag="$INBOUND_TAG" "$EMAIL" >/dev/null 2>&1 || true
 
-# 清理本地文件
 shopt -s nullglob
 for m in "$DIR"/*.meta; do
   [[ -f "$m" ]] || continue
@@ -461,9 +451,10 @@ DIR="/usr/local/etc/xray/tmpusers"
 LOG="/var/log/vless-user.log"
 LOCK="/var/lock/vless-tmpusers.lock"
 
-# 统一读取 API_HOST/API_PORT + 端口范围
 /usr/local/sbin/vless_load_env.sh
 API_SERVER="${API_SERVER}"
+TEMP_PORT_START="${TEMP_PORT_START}"
+TEMP_PORT_COUNT="${TEMP_PORT_COUNT}"
 
 exec 9>"$LOCK"
 flock -n 9 || { echo "❌ 另一个实例正在运行，请稍后重试"; exit 1; }
@@ -477,7 +468,6 @@ if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
   echo "❌ D 必须是正整数秒"; exit 1
 fi
 
-# TTL 失败兜底依赖 timer：提前提示
 if ! systemctl is-enabled --quiet vless-gc.timer 2>/dev/null; then
   echo "⚠️ vless-gc.timer 未启用：若 TTL unit 创建失败，过期节点可能无法自动回收。建议：systemctl enable --now vless-gc.timer" >&2
 elif ! systemctl is-active --quiet vless-gc.timer 2>/dev/null; then
@@ -494,7 +484,6 @@ while IFS= read -r p; do
   [[ -n "${cnt[$p]+x}" ]] && cnt[$p]=$((cnt[$p]+1))
 done < <(awk -F= '/^PORT=/{print $2}' "$DIR"/*.meta 2>/dev/null || true)
 
-# 最小使用数 + 随机打散
 best_n=999999
 for ((i=0;i<TEMP_PORT_COUNT;i++)); do
   p=$((TEMP_PORT_START+i))
@@ -573,11 +562,7 @@ fi
 if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${D}s" \
   /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG"; then
   echo "⚠️ systemd-run 创建 TTL 失败：将依赖 vless-gc.timer 兜底回收。" >&2
-  if systemctl enable --now vless-gc.timer >/dev/null 2>&1; then
-    echo "✅ 已尝试启用并启动 vless-gc.timer" >&2
-  else
-    echo "❌ 无法启用 vless-gc.timer，请手动检查 systemd/timer，否则过期节点可能不回收。" >&2
-  fi
+  systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
 fi
 
 MAIN="/root/vless_reality_vision_url.txt"
@@ -602,7 +587,7 @@ echo "$URL"
 MK
 chmod +x /usr/local/sbin/vless_mktemp.sh
 
-# ---- gc (父脚本持锁 + 调 rmu 子脚本；现在不会锁冲突) ----
+# ---- gc ----
 cat >/usr/local/sbin/vless_gc.sh <<'GC'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -684,7 +669,7 @@ done
 RS
 chmod +x /usr/local/sbin/vless_restore.sh
 
-# ---- audit / clear_all (父脚本持锁 + 调 rmu 子脚本；现在不会锁冲突) ----
+# ---- audit / clear_all ----
 cat >/usr/local/sbin/vless_audit.sh <<'AUD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -789,7 +774,7 @@ systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
 systemctl enable vless-restore.service >/dev/null 2>&1 || true
 systemctl start vless-restore.service >/dev/null 2>&1 || true
 
-echo "✅ 单进程 + 多端口 临时节点系统部署完成（含锁重入修复）"
+echo "✅ 单进程 + 多端口 临时节点系统部署完成（含锁重入最终修复）"
 echo "用法：D=600 vless_mktemp.sh / vless_audit.sh / vless_clear_all.sh"
 EOF
 
@@ -976,7 +961,7 @@ main() {
   cat <<DONE
 
 ==================================================
-✅ 已生成全部脚本（含锁重入修复：GC/clear_all 不再假删除）
+✅ 已生成全部脚本（含锁重入最终修复：fd9 复用不再受 /var/lock symlink 影响）
 - /root/onekey_reality_ipv4.sh
 - /root/vless_temp_audit_ipv4_all.sh
 
