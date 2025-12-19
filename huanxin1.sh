@@ -1,200 +1,106 @@
+cp /root/onekey_reality_ipv4.sh /root/onekey_reality_ipv4.sh.bak.$(date +%F-%H%M%S) 2>/dev/null || true
+
+cat >/root/onekey_reality_ipv4.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Debian 12 一键生成脚本（稳定增强版：省CPU + 稳定优先）
-# 已包含修复/增强：
-# 1) need_basic_tools: apt-get update 不吞错
-# 2) Xray outbounds 默认出口顺序：direct 第一（避免默认出口跑偏）
-# 3) pq_add/pq_del 端口校验
-# 4) systemd-run TTL 失败不再静默吞掉 + 检查/提示 vless-gc.timer（必要时尝试启用）
-# 5) /tmp 临时文件 mktemp 权限与清理
-# 6) pq_audit.sh：counter 缺失不再触发 set -e 退出
-# 7) 配置统一化：写入 /usr/local/etc/xray/env.conf，子脚本统一读取（API_PORT 不再硬编码漂移）
-# 8) 端口分配：最小使用数 + 随机打散（避免热点偏向第一个端口）
-# 9) ✅ 锁重入最终修复：vless_rmu_one.sh 只判断 fd9 是否存在来复用锁（避免 /var/lock -> /run/lock symlink 误判）
-# 10) ✅ Xray api 配置修复：不再生成 protocol="api" 的 outbound，避免 unknown config id: api
-# 11) ✅ x25519 输出兼容新版：PublicKey/Public key/Password 都能正确取到公钥
+# Debian 12 VLESS Reality (单进程 + 多端口临时用户) 一键脚本
+# - 使用新版 Xray API（api.listen 直接监听，不再用 dokodemo-door + protocol: api 出站）
+# - 兼容 2025.10+ 的 x25519 输出 (PublicKey / Password)
+# - 只生成主节点 + env.conf，其它辅助脚本由 huanxin1.sh 另一个脚本生成
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
 
 TEMP_PORT_START=40000
-TEMP_PORT_COUNT=40  # 40000-40039
+TEMP_PORT_COUNT=40   # 40000-40039
+
+XRAY_BIN="/usr/local/bin/xray"
+CFG_DIR="/usr/local/etc/xray"
+ENV_CONF="${CFG_DIR}/env.conf"
+MAIN_CFG="${CFG_DIR}/config.json"
 
 check_debian12() {
-  if [[ "$(id -u)" -ne 0 ]]; then
+  if [ "$(id -u)" -ne 0 ]; then
     echo "❌ 请以 root 运行本脚本"
     exit 1
   fi
   local codename
   codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 || true)
-  if [[ "$codename" != "bookworm" ]]; then
+  if [ "$codename" != "bookworm" ]; then
     echo "❌ 仅适用于 Debian 12 (bookworm)，当前: ${codename:-未知}"
     exit 1
   fi
 }
 
-need_basic_tools() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y || apt-get update -y || { echo "❌ apt-get update 失败"; exit 1; }
-
-  apt-get install -y \
-    curl wget openssl python3 nftables coreutils logrotate ca-certificates iproute2 util-linux jq \
-    || { echo "❌ apt 依赖安装失败"; exit 1; }
-}
-
-download_upstreams() {
-  echo "⬇ 下载/更新 上游文件到 ${UP_BASE} ..."
-  mkdir -p "$UP_BASE"
-  curl -fsSL --connect-timeout 3 --max-time 25 --retry 3 --retry-delay 1 --retry-all-errors \
-    "${REPO_BASE}/xray-install-release.sh" -o "${UP_BASE}/xray-install-release.sh"
-  chmod +x "${UP_BASE}/xray-install-release.sh"
-}
-
-install_logrotate_rules() {
-  echo "🧩 配置日志轮转（保留 2 天，旧的自动删）..."
-  cat >/etc/logrotate.d/portquota-vless <<'LR'
-/var/log/pq-save.log
-/var/log/vless-user.log
-/var/log/vless-user-gc.log
-/var/log/vless-user-restore.log
-{
-  daily
-  rotate 2
-  missingok
-  notifempty
-  nocompress
-  copytruncate
-  dateext
-  maxage 2
-}
-LR
-}
-
-install_update_all() {
-  cat >/usr/local/bin/update-all << 'EOF'
-#!/bin/bash
-set -euo pipefail
-
-[ "$(id -u)" -eq 0 ] || { echo "❌ root 运行"; exit 1; }
-codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 || true)
-[ "$codename" = "bookworm" ] || { echo "❌ 仅 Debian12 bookworm"; exit 1; }
-
-export DEBIAN_FRONTEND=noninteractive
-
-echo "🚀 更新系统包（不默认更换内核）..."
-apt-get update -y
-apt-get full-upgrade -y
-apt-get --purge autoremove -y
-apt-get autoclean -y
-apt-get clean -y
-echo "✅ 软件包更新完成"
-
-KVER="$(uname -r | sed 's/-.*//')"
-if [ "$(printf '%s\n' "4.9" "$KVER" | sort -V | head -n1)" = "$KVER" ] && [ "$KVER" != "4.9" ]; then
-  echo "⚠️ 检测到内核版本 $KVER < 4.9，BBR 可能不可用。"
-  echo "如需安装 backports 内核，请手动执行："
-  echo "  echo 'deb http://deb.debian.org/debian bookworm-backports main contrib non-free non-free-firmware' > /etc/apt/sources.list.d/backports.list"
-  echo "  apt-get update -y"
-  echo "  apt-get -t bookworm-backports install -y linux-image-amd64 linux-headers-amd64"
-  echo "  reboot"
-else
-  echo "✅ 当前内核 $KVER 已满足 BBR 要求，无需更换内核"
-fi
-EOF
-  chmod +x /usr/local/bin/update-all
-}
-
-install_vless_script_singleproc_40ports() {
-  echo "🧩 写入 /root/onekey_reality_ipv4.sh（含 env.conf + 修复后的 api 配置）..."
-
-  cat >/root/onekey_reality_ipv4.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-EOF
-
-  cat >>/root/onekey_reality_ipv4.sh <<EOF
-REPO_BASE="${REPO_BASE}"
-UP_BASE="${UP_BASE}"
-TEMP_PORT_START=${TEMP_PORT_START}
-TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
-EOF
-
-  cat >>/root/onekey_reality_ipv4.sh <<'EOF'
-
-check_debian12() {
-  [ "$(id -u)" -eq 0 ] || { echo "❌ root"; exit 1; }
-  local codename
-  codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 || true)
-  [ "$codename" = "bookworm" ] || { echo "❌ Debian12 bookworm only"; exit 1; }
-}
-
-install_xray() {
+install_xray_if_needed() {
   mkdir -p "$UP_BASE"
   local inst="$UP_BASE/xray-install-release.sh"
   if [ ! -x "$inst" ]; then
     curl -fsSL --connect-timeout 3 --max-time 30 --retry 3 --retry-delay 1 --retry-all-errors \
-      "$REPO_BASE/xray-install-release.sh" -o "$inst"
+      "${REPO_BASE}/xray-install-release.sh" -o "$inst"
     chmod +x "$inst"
   fi
-  "$inst" install --without-geodata
-  [ -x /usr/local/bin/xray ] || { echo "❌ xray 未安装成功"; exit 1; }
+  if [ ! -x "$XRAY_BIN" ]; then
+    echo "== 安装 Xray =="
+    "$inst" install --without-geodata
+  else
+    echo "== 更新 Xray 到最新稳定版 =="
+    "$inst" install --without-geodata
+  fi
+  if [ ! -x "$XRAY_BIN" ]; then
+    echo "❌ Xray 安装失败：未找到 ${XRAY_BIN}"
+    exit 1
+  fi
 }
 
 is_private_ip() {
   local ip="$1"
-  [[ "$ip" =~ ^10\. ]] && return 0
-  [[ "$ip" =~ ^192\.168\. ]] && return 0
-  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+  case "$ip" in
+    10.*) return 0 ;;
+    192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+  esac
   return 1
 }
 
 detect_ipv4_public_first() {
   local ip=""
 
+  # 1) 优先从外网接口获取
   ip="$(curl -4fsS --connect-timeout 2 --max-time 6 --retry 2 --retry-delay 1 --retry-all-errors https://api.ipify.org || true)"
-  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
-    echo "$ip"; return 0
+  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+    echo "$ip"
+    return 0
   fi
 
+  # 2) 再尝试根据路由表推断出网 IPv4
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
-    echo "$ip"; return 0
+  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+    echo "$ip"
+    return 0
   fi
 
+  # 3) 最后尝试 hostname -I
   ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  if [[ -n "$ip" && ! is_private_ip "$ip" ]]; then
-    echo "$ip"; return 0
+  if [ -n "$ip" ] && ! is_private_ip "$ip"; then
+    echo "$ip"
+    return 0
   fi
 
   echo ""
 }
 
-check_port_free_443() {
-  if ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq '(:|\])443$'; then
-    echo "❌ 443 已被占用，xray 无法监听。请先释放 443 或改 MAIN_PORT。"
-    ss -lntp 2>/dev/null | grep -E '(:|\])443\b' || true
+check_port_free() {
+  local port="$1"
+  if ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(:|])${port}\$"; then
+    echo "❌ 端口 ${port} 已被占用，请先释放或修改 MAIN_PORT/API_PORT"
+    ss -lntp 2>/dev/null | grep -E "(:|])${port}\b" || true
     exit 1
   fi
 }
 
-main() {
-  check_debian12
-
-  # —— 核心配置（会写入 env.conf 供其它脚本复用）——
-  REALITY_DOMAIN="www.apple.com"
-  MAIN_PORT=443
-  MAIN_TAG="vless-main"
-
-  API_HOST="127.0.0.1"
-  API_PORT=10085
-  API_TAG="api"
-
-  SERVER_IP="$(detect_ipv4_public_first)"
-  [ -n "$SERVER_IP" ] || { echo "❌ 无法检测公网 IPv4（或拿到的是内网 IP）"; exit 1; }
-
-  check_port_free_443
-
+enable_bbr() {
   echo "=== 1) 只开启 fq + bbr（其余 sysctl 保持默认）==="
   cat >/etc/sysctl.d/99-bbr.conf <<'SYS'
 net.core.default_qdisc=fq
@@ -203,31 +109,33 @@ SYS
   modprobe tcp_bbr 2>/dev/null || true
   sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
   echo "当前: qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown), cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+}
 
-  echo "=== 2) 安装/更新 xray ==="
-  install_xray
-  systemctl stop xray 2>/dev/null || true
-
+generate_reality_keys() {
   echo "=== 3) UUID + Reality 密钥 ==="
-  XRAY_BIN="/usr/local/bin/xray"
   UUID="$("$XRAY_BIN" uuid)"
+  if [ -z "$UUID" ]; then
+    echo "❌ 生成 UUID 失败"
+    exit 1
+  fi
 
-  KEY_OUT="$("$XRAY_BIN" x25519)"
-  PRIVATE_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PrivateKey:/ {print $2;exit} /^Private key:/ {print $3;exit}')"
-  PUBLIC_KEY="$(printf '%s\n' "$KEY_OUT" | awk '/^PublicKey:/ {print $2;exit} /^Public key:/ {print $3;exit} /^Password:/ {print $2;exit}')"
+  local key_out
+  key_out="$("$XRAY_BIN" x25519)"
+
+  PRIVATE_KEY="$(printf '%s\n' "$key_out" | grep -i '^PrivateKey:' | awk '{print $2}' || true)"
+  PUBLIC_KEY="$(printf '%s\n' "$key_out" | grep -E '^(PublicKey|Password):' | awk '{print $2}' || true)"
+
   if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
-    echo "❌ Reality key 解析失败，原始输出："
-    printf '%s\n' "$KEY_OUT"
+    echo "❌ 解析 Reality 密钥失败，原始输出如下："
+    printf '%s\n' "$key_out"
     exit 1
   fi
 
   SHORT_ID="$(openssl rand -hex 8)"
+}
 
-  CFG_DIR=/usr/local/etc/xray
+write_env_conf() {
   mkdir -p "$CFG_DIR"
-
-  # ✅ 统一配置文件：子脚本统一读取，避免 API_PORT/端口段硬编码漂移
-  ENV_CONF="${CFG_DIR}/env.conf"
   cat >"$ENV_CONF" <<CONFENV
 REALITY_DOMAIN=${REALITY_DOMAIN}
 MAIN_PORT=${MAIN_PORT}
@@ -237,13 +145,22 @@ TEMP_PORT_START=${TEMP_PORT_START}
 TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
 CONFENV
   chmod 600 "$ENV_CONF" 2>/dev/null || true
+}
 
-  TMP_INBOUNDS=""
+build_config_json() {
+  echo "=== 4) 生成 Xray 主配置（单进程 + 多端口 + API）==="
+
+  local tmp_cfg
+  tmp_cfg="$(mktemp /tmp/xray-main.XXXXXX.json)"
+
+  # 拼接 40 个临时端口 inbound
+  local tmp_inbounds=""
+  local i p tag
   for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
-    p=$((TEMP_PORT_START+i))
-    tag="vless-tmp-$p"
-    TMP_INBOUNDS+=$(cat <<JSON
-,
+    p=$((TEMP_PORT_START + i))
+    tag="vless-tmp-${p}"
+    tmp_inbounds+=$(cat <<JSON
+    ,
     {
       "tag": "${tag}",
       "listen": "0.0.0.0",
@@ -270,13 +187,14 @@ JSON
 )
   done
 
-  cat >"$CFG_DIR/config.json" <<CONF
+  cat >"$tmp_cfg" <<CONF
 {
   "log": {
     "loglevel": "warning"
   },
   "api": {
     "tag": "${API_TAG}",
+    "listen": "${API_HOST}:${API_PORT}",
     "services": [
       "HandlerService",
       "LoggerService",
@@ -284,7 +202,6 @@ JSON
       "RoutingService"
     ]
   },
-  "stats": {},
   "inbounds": [
     {
       "tag": "${MAIN_TAG}",
@@ -293,7 +210,11 @@ JSON
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${UUID}", "email": "main@local", "flow": "xtls-rprx-vision" }
+          {
+            "id": "${UUID}",
+            "email": "main@local",
+            "flow": "xtls-rprx-vision"
+          }
         ],
         "decryption": "none"
       },
@@ -309,43 +230,27 @@ JSON
           "shortIds": [ "${SHORT_ID}" ]
         }
       }
-    ${TMP_INBOUNDS}
-    ,
-    {
-      "tag": "${API_TAG}",
-      "listen": "${API_HOST}",
-      "port": ${API_PORT},
-      "protocol": "dokodemo-door",
-      "settings": { "address": "${API_HOST}" }
-    }
+    }${tmp_inbounds}
   ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "inboundTag": [ "${API_TAG}" ],
-        "outboundTag": "${API_TAG}"
-      }
-    ]
-  },
   "outbounds": [
-    { "tag": "direct", "protocol": "freedom" },
-    { "tag": "block",  "protocol": "blackhole" }
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
   ]
 }
 CONF
 
-  mkdir -p /etc/systemd/system/xray.service.d
-  cat >/etc/systemd/system/xray.service.d/override.conf <<'OVR'
-[Service]
-LimitNOFILE=1048576
-Nice=-5
-Restart=on-failure
-RestartSec=1
-OVR
+  mv "$tmp_cfg" "$MAIN_CFG"
+}
 
-  # 先测试配置
-  "$XRAY_BIN" run -test -config /usr/local/etc/xray/config.json
+restart_xray() {
+  echo "=== 5) 检查并重启 Xray ==="
+  "$XRAY_BIN" run -test -config "$MAIN_CFG"
 
   systemctl daemon-reload
   systemctl enable xray >/dev/null 2>&1 || true
@@ -359,659 +264,59 @@ OVR
     exit 1
   fi
 
-  NODE_NAME="VLESS-REALITY-IPv4-APPLE"
-  VLESS_URL="vless://${UUID}@${SERVER_IP}:${MAIN_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${NODE_NAME}"
+  echo "== 监听端口检测 =="
+  ss -lntp 2>/dev/null | grep -E "xray|:${MAIN_PORT}\b|:${API_PORT}\b|:${TEMP_PORT_START}\b" || true
+}
 
-  echo "$VLESS_URL" >/root/vless_reality_vision_url.txt
+write_main_url() {
+  local node_name="VLESS-REALITY-IPv4-APPLE"
+  local url="vless://${UUID}@${SERVER_IP}:${MAIN_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${node_name}"
+
+  echo "$url" > /root/vless_reality_vision_url.txt
   if base64 --help 2>/dev/null | grep -q -- "-w"; then
-    echo "$VLESS_URL" | base64 -w0 >/root/v2ray_subscription_base64.txt
+    echo "$url" | base64 -w0 > /root/v2ray_subscription_base64.txt
   else
-    echo "$VLESS_URL" | base64 | tr -d '\n' >/root/v2ray_subscription_base64.txt
+    echo "$url" | base64 | tr -d '\n' > /root/v2ray_subscription_base64.txt
   fi
 
-  echo "✅ 主节点完成：443 + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
+  echo "✅ 主节点完成：${MAIN_PORT} + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
   echo "统一配置文件：${ENV_CONF}"
   echo "主节点链接："
   cat /root/vless_reality_vision_url.txt
 }
 
-main "$@"
-EOF
-
-  chmod +x /root/onekey_reality_ipv4.sh
-}
-
-install_temp_users_40ports() {
-  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（含锁重入最终修复）..."
-
-  cat >/root/vless_temp_audit_ipv4_all.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-DIR="/usr/local/etc/xray/tmpusers"
-LOG_USER="/var/log/vless-user.log"
-LOG_GC="/var/log/vless-user-gc.log"
-LOG_RS="/var/log/vless-user-restore.log"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-mkdir -p "$DIR"
-touch "$LOG_USER" "$LOG_GC" "$LOG_RS" 2>/dev/null || true
-chmod 700 "$DIR" || true
-
-# ---- helper: load env ----
-cat >/usr/local/sbin/vless_load_env.sh <<'LEN'
-#!/usr/bin/env bash
-set -euo pipefail
-
-ENV_CONF="/usr/local/etc/xray/env.conf"
-
-REALITY_DOMAIN="${REALITY_DOMAIN:-www.apple.com}"
-MAIN_PORT="${MAIN_PORT:-443}"
-API_HOST="${API_HOST:-127.0.0.1}"
-API_PORT="${API_PORT:-10085}"
-TEMP_PORT_START="${TEMP_PORT_START:-40000}"
-TEMP_PORT_COUNT="${TEMP_PORT_COUNT:-40}"
-
-if [[ -f "$ENV_CONF" ]]; then
-  # shellcheck disable=SC1090
-  . "$ENV_CONF" || true
-fi
-
-[[ "${API_PORT}" =~ ^[0-9]+$ ]] || API_PORT=10085
-[[ "${TEMP_PORT_START}" =~ ^[0-9]+$ ]] || TEMP_PORT_START=40000
-[[ "${TEMP_PORT_COUNT}" =~ ^[0-9]+$ ]] || TEMP_PORT_COUNT=40
-(( TEMP_PORT_COUNT > 0 )) || TEMP_PORT_COUNT=40
-
-export REALITY_DOMAIN MAIN_PORT API_HOST API_PORT TEMP_PORT_START TEMP_PORT_COUNT
-export API_SERVER="${API_HOST}:${API_PORT}"
-LEN
-chmod +x /usr/local/sbin/vless_load_env.sh
-
-# ---- rmu (✅锁重入最终修复版：只判断 fd9 是否存在) ----
-cat >/usr/local/sbin/vless_rmu_one.sh <<'RMU'
-#!/usr/bin/env bash
-set -euo pipefail
-
-EMAIL="${1:?need email}"
-INBOUND_TAG="${2:?need inbound tag}"
-
-XRAY_BIN="/usr/local/bin/xray"
-DIR="/usr/local/etc/xray/tmpusers"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-if [[ -x /usr/local/sbin/vless_load_env.sh ]]; then
-  /usr/local/sbin/vless_load_env.sh
-  API_SERVER="${API_SERVER:-127.0.0.1:10085}"
-else
-  API_SERVER="127.0.0.1:10085"
-fi
-
-if [[ -e "/proc/$$/fd/9" ]]; then
-  :
-else
-  exec 9>"$LOCK"
-fi
-
-flock -n 9 || { echo "❌ busy"; exit 1; }
-
-"$XRAY_BIN" api rmu -s "$API_SERVER" -tag="$INBOUND_TAG" "$EMAIL" >/dev/null 2>&1 || true
-
-shopt -s nullglob
-for m in "$DIR"/*.meta; do
-  [[ -f "$m" ]] || continue
-  if grep -q "EMAIL=$EMAIL" "$m"; then
-    rm -f "$m" "${m%.meta}.json" 2>/dev/null || true
-  fi
-done
-RMU
-chmod +x /usr/local/sbin/vless_rmu_one.sh
-
-# ---- mktemp ----
-cat >/usr/local/sbin/vless_mktemp.sh <<'MK'
-#!/usr/bin/env bash
-set -euo pipefail
-: "${D:?用法: D=600 vless_mktemp.sh}"
-
-XRAY_BIN="/usr/local/bin/xray"
-DIR="/usr/local/etc/xray/tmpusers"
-LOG="/var/log/vless-user.log"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-/usr/local/sbin/vless_load_env.sh
-API_SERVER="${API_SERVER}"
-TEMP_PORT_START="${TEMP_PORT_START}"
-TEMP_PORT_COUNT="${TEMP_PORT_COUNT}"
-
-exec 9>"$LOCK"
-flock -n 9 || { echo "❌ 另一个实例正在运行，请稍后重试"; exit 1; }
-
-if ! "$XRAY_BIN" help api 2>/dev/null | grep -qE '\badu\b'; then
-  echo "❌ xray 不支持 api adu/rmu"; exit 1
-fi
-systemctl is-active --quiet xray.service || { echo "❌ xray.service 未运行"; exit 1; }
-
-if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
-  echo "❌ D 必须是正整数秒"; exit 1
-fi
-
-if ! systemctl is-enabled --quiet vless-gc.timer 2>/dev/null; then
-  echo "⚠️ vless-gc.timer 未启用：若 TTL unit 创建失败，过期节点可能无法自动回收。建议：systemctl enable --now vless-gc.timer" >&2
-elif ! systemctl is-active --quiet vless-gc.timer 2>/dev/null; then
-  echo "⚠️ vless-gc.timer 未运行：建议：systemctl start vless-gc.timer" >&2
-fi
-
-declare -A cnt
-for ((i=0;i<TEMP_PORT_COUNT;i++)); do
-  cnt[$((TEMP_PORT_START+i))]=0
-done
-
-while IFS= read -r p; do
-  [[ "$p" =~ ^[0-9]+$ ]] || continue
-  [[ -n "${cnt[$p]+x}" ]] && cnt[$p]=$((cnt[$p]+1))
-done < <(awk -F= '/^PORT=/{print $2}' "$DIR"/*.meta 2>/dev/null || true)
-
-best_n=999999
-for ((i=0;i<TEMP_PORT_COUNT;i++)); do
-  p=$((TEMP_PORT_START+i))
-  n=${cnt[$p]}
-  if (( n < best_n )); then best_n=$n; fi
-done
-
-cands=()
-for ((i=0;i<TEMP_PORT_COUNT;i++)); do
-  p=$((TEMP_PORT_START+i))
-  n=${cnt[$p]}
-  if (( n == best_n )); then cands+=("$p"); fi
-done
-
-if command -v shuf >/dev/null 2>&1; then
-  PORT="$(printf '%s\n' "${cands[@]}" | shuf -n1)"
-else
-  idx=$((RANDOM % ${#cands[@]}))
-  PORT="${cands[$idx]}"
-fi
-
-INBOUND_TAG="vless-tmp-$PORT"
-
-TAG="vless-temp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)"
-UUID="$("$XRAY_BIN" uuid)"
-EMAIL="${TAG}@temp"
-NOW=$(date +%s)
-EXP=$((NOW + D))
-
-CFG="$DIR/${TAG}.json"
-META="$DIR/${TAG}.meta"
-
-cat >"$CFG" <<JSON
-{
-  "inbounds": [
-    {
-      "tag": "${INBOUND_TAG}",
-      "protocol": "vless",
-      "settings": {
-        "decryption": "none",
-        "clients": [
-          { "email": "${EMAIL}", "id": "${UUID}", "flow": "xtls-rprx-vision" }
-        ]
-      }
-    }
-  ]
-}
-JSON
-
-TMPLOG="$(mktemp /tmp/adu.XXXXXX.log)"
-chmod 600 "$TMPLOG" 2>/dev/null || true
-trap 'rm -f "$TMPLOG" 2>/dev/null || true' EXIT
-
-if ! "$XRAY_BIN" api adu -s "$API_SERVER" "$CFG" >"$TMPLOG" 2>&1; then
-  cat "$TMPLOG" >&2
-  echo "❌ adu 失败（API_SERVER=$API_SERVER）"
-  exit 1
-fi
-
-cat >"$META" <<M
-TAG=$TAG
-EMAIL=$EMAIL
-UUID=$UUID
-PORT=$PORT
-INBOUND_TAG=$INBOUND_TAG
-EXPIRE_EPOCH=$EXP
-M
-chmod 600 "$META" "$CFG" 2>/dev/null || true
-
-UNIT="vless-expire-$TAG"
-if systemctl status "${UNIT}.service" >/dev/null 2>&1; then
-  systemctl stop "${UNIT}.service" >/dev/null 2>&1 || true
-  systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
-fi
-
-if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${D}s" \
-  /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG"; then
-  echo "⚠️ systemd-run 创建 TTL 失败：将依赖 vless-gc.timer 兜底回收。" >&2
-  systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
-fi
-
-MAIN="/root/vless_reality_vision_url.txt"
-URL="(未找到 /root/vless_reality_vision_url.txt，请用同参数拼接，端口=$PORT UUID=$UUID)"
-if [[ -f "$MAIN" ]]; then
-  BASE="$(sed -n '1p' "$MAIN" || true)"
-  if [[ -n "$BASE" ]]; then
-    URL="$(echo "$BASE" \
-      | sed -E "s#^vless://[^@]+@#vless://${UUID}@#; s#@([^:/]+):[0-9]+\?#@\1:${PORT}?#; s/#.*/#${TAG}/")"
-  fi
-fi
-
-E_STR=$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')
-echo "$(date '+%F %T %Z') create $TAG port=$PORT email=$EMAIL exp=$EXP" >> "$LOG" 2>/dev/null || true
-
-echo "✅ 新临时节点(单进程): $TAG"
-echo "端口: $PORT （inbound: $INBOUND_TAG）"
-echo "UUID: $UUID"
-echo "到期(北京时间): $E_STR"
-echo "链接:"
-echo "$URL"
-MK
-chmod +x /usr/local/sbin/vless_mktemp.sh
-
-# ---- gc ----
-cat >/usr/local/sbin/vless_gc.sh <<'GC'
-#!/usr/bin/env bash
-set -euo pipefail
-shopt -s nullglob
-
-DIR="/usr/local/etc/xray/tmpusers"
-LOG="/var/log/vless-user-gc.log"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-exec 9>"$LOCK"
-flock -n 9 || exit 0
-
-touch "$LOG" 2>/dev/null || true
-NOW=$(date +%s)
-
-for META in "$DIR"/*.meta; do
-  unset TAG EMAIL EXPIRE_EPOCH INBOUND_TAG
-  . "$META" 2>/dev/null || continue
-  [[ -z "${EMAIL:-}" || -z "${EXPIRE_EPOCH:-}" || -z "${INBOUND_TAG:-}" ]] && continue
-  [[ ! "${EXPIRE_EPOCH}" =~ ^[0-9]+$ ]] && continue
-  if (( EXPIRE_EPOCH <= NOW )); then
-    /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG" || true
-    echo "$(date '+%F %T %Z') [gc] removed $EMAIL tag=$INBOUND_TAG" >> "$LOG" 2>/dev/null || true
-  fi
-done
-GC
-chmod +x /usr/local/sbin/vless_gc.sh
-
-# ---- restore ----
-cat >/usr/local/sbin/vless_restore.sh <<'RS'
-#!/usr/bin/env bash
-set -euo pipefail
-shopt -s nullglob
-
-XRAY_BIN="/usr/local/bin/xray"
-DIR="/usr/local/etc/xray/tmpusers"
-LOG="/var/log/vless-user-restore.log"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-/usr/local/sbin/vless_load_env.sh
-API_SERVER="${API_SERVER}"
-
-exec 9>"$LOCK"
-flock -n 9 || exit 0
-
-touch "$LOG" 2>/dev/null || true
-NOW=$(date +%s)
-
-for META in "$DIR"/*.meta; do
-  unset EXPIRE_EPOCH INBOUND_TAG EMAIL TAG
-  . "$META" 2>/dev/null || continue
-  [[ -z "${EXPIRE_EPOCH:-}" || -z "${INBOUND_TAG:-}" || -z "${EMAIL:-}" || -z "${TAG:-}" ]] && continue
-  [[ ! "${EXPIRE_EPOCH}" =~ ^[0-9]+$ ]] && continue
-  CFG="${META%.meta}.json"
-
-  if (( EXPIRE_EPOCH > NOW )); then
-    if [[ -f "$CFG" ]]; then
-      "$XRAY_BIN" api adu -s "$API_SERVER" "$CFG" >/dev/null 2>&1 || true
-      REM=$((EXPIRE_EPOCH - NOW))
-
-      UNIT="vless-expire-$TAG"
-      if systemctl status "${UNIT}.service" >/dev/null 2>&1; then
-        systemctl stop "${UNIT}.service" >/dev/null 2>&1 || true
-        systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
-      fi
-
-      if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${REM}s" \
-        /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG"; then
-        echo "⚠️ [restore] systemd-run TTL 失败：将依赖 vless-gc.timer 兜底。" >&2
-        systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
-      fi
-
-      echo "$(date '+%F %T %Z') [restore] $TAG rem=${REM}s" >> "$LOG" 2>/dev/null || true
-    fi
-  else
-    rm -f "$META" "$CFG" 2>/dev/null || true
-  fi
-done
-RS
-chmod +x /usr/local/sbin/vless_restore.sh
-
-# ---- audit / clear_all ----
-cat >/usr/local/sbin/vless_audit.sh <<'AUD'
-#!/usr/bin/env bash
-set -euo pipefail
-shopt -s nullglob
-
-DIR="/usr/local/etc/xray/tmpusers"
-echo "==== XRAY 主进程 ===="
-echo "xray.service: $(systemctl is-active xray.service 2>/dev/null || echo unknown)"
-echo
-
-printf "%-42s %-6s %-6s %-20s %-14s %-20s\n" "TAG" "PORT" "STATE" "EMAIL" "LEFT" "EXPIRE(China)"
-NOW=$(date +%s)
-
-for META in "$DIR"/*.meta; do
-  unset TAG EMAIL PORT EXPIRE_EPOCH
-  . "$META" 2>/dev/null || continue
-  [[ -z "${TAG:-}" || -z "${EMAIL:-}" || -z "${PORT:-}" || -z "${EXPIRE_EPOCH:-}" ]] && continue
-  [[ ! "${EXPIRE_EPOCH}" =~ ^[0-9]+$ ]] && continue
-
-  LEFT=$((EXPIRE_EPOCH - NOW))
-  if (( LEFT <= 0 )); then
-    STATE="expired"
-    LEFT_STR="expired"
-  else
-    STATE="alive"
-    D=$((LEFT/86400)); H=$(((LEFT%86400)/3600)); M=$(((LEFT%3600)/60))
-    LEFT_STR=$(printf "%02dd%02dh%02dm" "$D" "$H" "$M")
-  fi
-  EXPIRE_AT_FMT="$(TZ='Asia/Shanghai' date -d "@${EXPIRE_EPOCH}" '+%Y-%m-%d %H:%M:%S')"
-  printf "%-42s %-6s %-6s %-20s %-14s %-20s\n" "$TAG" "$PORT" "$STATE" "$EMAIL" "$LEFT_STR" "$EXPIRE_AT_FMT"
-done
-AUD
-chmod +x /usr/local/sbin/vless_audit.sh
-
-cat >/usr/local/sbin/vless_clear_all.sh <<'CLR'
-#!/usr/bin/env bash
-set -euo pipefail
-shopt -s nullglob
-
-DIR="/usr/local/etc/xray/tmpusers"
-LOCK="/var/lock/vless-tmpusers.lock"
-
-exec 9>"$LOCK"
-flock -n 9 || { echo "❌ busy"; exit 1; }
-
-echo "== 清空所有临时节点 =="
-for META in "$DIR"/*.meta; do
-  unset EMAIL INBOUND_TAG
-  . "$META" 2>/dev/null || continue
-  [[ -z "${EMAIL:-}" || -z "${INBOUND_TAG:-}" ]] && continue
-  /usr/local/sbin/vless_rmu_one.sh "$EMAIL" "$INBOUND_TAG" || true
-done
-echo "✅ done"
-CLR
-chmod +x /usr/local/sbin/vless_clear_all.sh
-
-# ---- systemd units ----
-cat >/etc/systemd/system/vless-restore.service <<'SVC'
-[Unit]
-Description=Restore temp VLESS users (single xray, multi-port)
-After=network.target xray.service
-Wants=xray.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vless_restore.sh
-Nice=19
-IOSchedulingClass=idle
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-cat >/etc/systemd/system/vless-gc.service <<'SVC'
-[Unit]
-Description=GC temp VLESS users (single xray, multi-port)
-After=network.target xray.service
-Wants=xray.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vless_gc.sh
-Nice=19
-IOSchedulingClass=idle
-SVC
-
-cat >/etc/systemd/system/vless-gc.timer <<'TMR'
-[Unit]
-Description=Run VLESS GC every 10 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TMR
-
-systemctl daemon-reload
-systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
-systemctl enable vless-restore.service >/dev/null 2>&1 || true
-systemctl start vless-restore.service >/dev/null 2>&1 || true
-
-echo "✅ 单进程 + 多端口 临时节点系统部署完成（含锁重入最终修复）"
-echo "用法：D=600 vless_mktemp.sh / vless_audit.sh / vless_clear_all.sh"
-EOF
-
-  chmod +x /root/vless_temp_audit_ipv4_all.sh
-}
-
-install_port_quota_hard_10min() {
-  echo "🧩 部署 TCP 上行配额系统（硬配额：超量立即 drop；10 分钟保存快照；保存带 flush ruleset）..."
-  apt-get install -y nftables >/dev/null 2>&1 || true
-  mkdir -p /etc/portquota
-
-  nft list table inet portquota >/dev/null 2>&1 || nft add table inet portquota
-  nft list chain inet portquota down_out >/dev/null 2>&1 || nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
-
-  systemctl enable --now nftables >/dev/null 2>&1 || true
-
-  cat >/usr/local/sbin/pq_save.sh <<'SAVE'
-#!/usr/bin/env bash
-set -euo pipefail
-TMP="/etc/nftables.conf.tmp"
-DST="/etc/nftables.conf"
-LOG="/var/log/pq-save.log"
-touch "$LOG" 2>/dev/null || true
-
-{
-  echo "flush ruleset"
-  nft list ruleset
-} > "$TMP" || {
-  echo "$(date '+%F %T %Z') [pq-save] 导出失败" >> "$LOG"
-  rm -f "$TMP" 2>/dev/null || true
-  exit 1
-}
-
-mv "$TMP" "$DST"
-echo "$(date '+%F %T %Z') [pq-save] saved" >> "$LOG"
-SAVE
-  chmod +x /usr/local/sbin/pq_save.sh
-
-  cat >/usr/local/sbin/pq_add.sh <<'ADD'
-#!/usr/bin/env bash
-set -euo pipefail
-PORT="${1:-}"; GIB="${2:-}"
-[[ -n "$PORT" && -n "$GIB" ]] || { echo "用法: pq_add.sh <端口> <GiB整数>"; exit 1; }
-
-[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "❌ 端口必须是数字"; exit 1; }
-(( PORT >= 1 && PORT <= 65535 )) || { echo "❌ 端口范围必须 1-65535"; exit 1; }
-
-[[ "$GIB" =~ ^[0-9]+$ ]] || { echo "❌ GiB需整数"; exit 1; }
-BYTES=$((GIB * 1024 * 1024 * 1024))
-
-nft -a list chain inet portquota down_out 2>/dev/null | awk -v p="$PORT" '$0 ~ "tcp sport "p" " {print $NF}' \
-  | while read -r h; do nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true; done
-
-nft delete counter inet portquota "pq_allow_$PORT" 2>/dev/null || true
-nft delete counter inet portquota "pq_drop_$PORT"  2>/dev/null || true
-nft add counter inet portquota "pq_allow_$PORT"
-nft add counter inet portquota "pq_drop_$PORT"
-
-nft add rule inet portquota down_out tcp sport "$PORT" \
-  quota over "$BYTES" bytes counter name "pq_drop_$PORT" drop comment "pq-drop-$PORT"
-
-nft add rule inet portquota down_out tcp sport "$PORT" \
-  counter name "pq_allow_$PORT" accept comment "pq-allow-$PORT"
-
-cat >/etc/portquota/pq-"$PORT".meta <<M
-PORT=$PORT
-LIMIT_BYTES=$BYTES
-LIMIT_GIB=$GIB
-MODE=quota_hard
-ALLOW_COUNTER=pq_allow_$PORT
-DROP_COUNTER=pq_drop_$PORT
-M
-
-/usr/local/sbin/pq_save.sh >/dev/null 2>&1 || true
-echo "✅ 端口 $PORT 硬配额 ${GIB}GiB（超量立即 drop）"
-ADD
-  chmod +x /usr/local/sbin/pq_add.sh
-
-  cat >/usr/local/sbin/pq_del.sh <<'DEL'
-#!/usr/bin/env bash
-set -euo pipefail
-PORT="${1:-}"
-[[ -n "$PORT" ]] || { echo "用法: pq_del.sh <端口>"; exit 1; }
-
-[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "❌ 端口必须是数字"; exit 1; }
-(( PORT >= 1 && PORT <= 65535 )) || { echo "❌ 端口范围必须 1-65535"; exit 1; }
-
-nft -a list chain inet portquota down_out 2>/dev/null | awk -v p="$PORT" '$0 ~ "tcp sport "p" " {print $NF}' \
-  | while read -r h; do nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true; done
-
-nft delete counter inet portquota "pq_allow_$PORT" 2>/dev/null || true
-nft delete counter inet portquota "pq_drop_$PORT"  2>/dev/null || true
-rm -f /etc/portquota/pq-"$PORT".meta
-
-/usr/local/sbin/pq_save.sh >/dev/null 2>&1 || true
-echo "✅ 删除端口 $PORT 配额"
-DEL
-  chmod +x /usr/local/sbin/pq_del.sh
-
-  cat >/usr/local/sbin/pq_audit.sh <<'AUDIT'
-#!/usr/bin/env bash
-set -euo pipefail
-shopt -s nullglob
-
-get_bytes() {
-  local c="$1"
-  nft list counter inet portquota "$c" 2>/dev/null \
-    | awk '/bytes/{for(i=1;i<=NF;i++) if($i=="bytes"){print $(i+1); exit}}' \
-    | head -n1 \
-    || true
-}
-
-printf "%-8s %-10s %-12s %-12s %-8s %-12s %-12s\n" "PORT" "STATE" "USED(GiB)" "LIMIT(GiB)" "PERCENT" "ALLOW(GiB)" "DROP(GiB)"
-
-for META in /etc/portquota/pq-*.meta; do
-  unset PORT LIMIT_BYTES MODE ALLOW_COUNTER DROP_COUNTER
-  . "$META" 2>/dev/null || continue
-  [[ -z "${PORT:-}" || -z "${LIMIT_BYTES:-}" || -z "${MODE:-}" ]] && continue
-  ALLOW_COUNTER="${ALLOW_COUNTER:-pq_allow_${PORT}}"
-  DROP_COUNTER="${DROP_COUNTER:-pq_drop_${PORT}}"
-
-  A="$(get_bytes "$ALLOW_COUNTER")"; [[ -z "$A" ]] && A=0
-  D="$(get_bytes "$DROP_COUNTER")";  [[ -z "$D" ]] && D=0
-  CUR=$((A + D))
-
-  USED="$(awk -v b="$CUR" 'BEGIN{printf "%.2f",b/1024/1024/1024}')"
-  LIM="$(awk -v b="$LIMIT_BYTES" 'BEGIN{printf "%.2f",b/1024/1024/1024}')"
-  AL="$(awk -v b="$A" 'BEGIN{printf "%.2f",b/1024/1024/1024}')"
-  DR="$(awk -v b="$D" 'BEGIN{printf "%.2f",b/1024/1024/1024}')"
-  PCT="$(awk -v u="$CUR" -v l="$LIMIT_BYTES" 'BEGIN{if(l>0) printf "%.1f%%",(u*100.0)/l; else print "N/A"}')"
-
-  STATE="ok"
-  if (( D > 0 )); then
-    STATE="dropped"
-  elif (( A >= LIMIT_BYTES )); then
-    STATE="limit"
-  fi
-
-  printf "%-8s %-10s %-12s %-12s %-8s %-12s %-12s\n" "$PORT" "$STATE" "$USED" "$LIM" "$PCT" "$AL" "$DR"
-done
-AUDIT
-  chmod +x /usr/local/sbin/pq_audit.sh
-
-  cat >/etc/systemd/system/pq-save.service <<'PQSVC'
-[Unit]
-Description=Save nftables ruleset
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/pq_save.sh
-Nice=19
-IOSchedulingClass=idle
-PQSVC
-
-  cat >/etc/systemd/system/pq-save.timer <<'PQTMR'
-[Unit]
-Description=Periodically save nftables ruleset
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=600s
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-PQTMR
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now pq-save.timer >/dev/null 2>&1 || true
-  /usr/local/sbin/pq_save.sh >/dev/null 2>&1 || true
-}
-
 main() {
   check_debian12
-  need_basic_tools
-  download_upstreams
 
-  install_logrotate_rules
-  install_update_all
-  install_vless_script_singleproc_40ports
-  install_temp_users_40ports
-  install_port_quota_hard_10min
+  # 核心变量（可按需手动改）
+  REALITY_DOMAIN="www.apple.com"
+  MAIN_PORT=443
+  MAIN_TAG="vless-main"
+  API_HOST="127.0.0.1"
+  API_PORT=10085
+  API_TAG="api"
 
-  cat <<DONE
+  enable_bbr
+  install_xray_if_needed
 
-==================================================
-✅ 已生成全部脚本（含锁重入最终修复：fd9 复用不再受 /var/lock symlink 影响）
-- /root/onekey_reality_ipv4.sh
-- /root/vless_temp_audit_ipv4_all.sh
+  SERVER_IP="$(detect_ipv4_public_first)"
+  if [ -z "$SERVER_IP" ]; then
+    echo "❌ 无法自动检测公网 IPv4（可能是内网 / 无法连外网）。"
+    echo "   请手动导出你的公网 IPv4 后再运行本脚本，或者改脚本内 SERVER_IP。"
+    exit 1
+  fi
 
-建议顺序：
-1) update-all && reboot
-2) bash /root/onekey_reality_ipv4.sh     （写 /usr/local/etc/xray/env.conf + 主节点）
-3) bash /root/vless_temp_audit_ipv4_all.sh
+  check_port_free "$MAIN_PORT"
+  check_port_free "$API_PORT"
 
-常用命令：
-- 创建临时节点：
-  D=600 vless_mktemp.sh
-
-- 审计临时节点：
-  vless_audit.sh
-
-- 清空所有临时节点：
-  vless_clear_all.sh
-
-配额：
-- pq_add.sh 40000 50
-- pq_audit.sh
-- pq_del.sh 40000
-==================================================
-DONE
+  generate_reality_keys
+  write_env_conf
+  build_config_json
+  restart_xray
+  write_main_url
 }
 
 main "$@"
+EOF
+
+chmod +x /root/onekey_reality_ipv4.sh
