@@ -3,14 +3,15 @@ set -euo pipefail
 
 # Debian 12 一键生成脚本（稳定增强版：省CPU + 稳定优先）
 # 已包含修复/增强：
-# 1) need_basic_tools: apt-get update 不再吞错
+# 1) need_basic_tools: apt-get update 不吞错
 # 2) Xray outbounds 默认出口顺序：direct 第一，api 最后（避免默认出口跑偏）
 # 3) pq_add/pq_del 端口校验
-# 4) systemd-run TTL 失败不再静默吞掉 + 检查/提示 vless-gc.timer 状态（必要时尝试启用）
+# 4) systemd-run TTL 失败不再静默吞掉 + 检查/提示 vless-gc.timer（必要时尝试启用）
 # 5) /tmp 临时文件 mktemp 权限与清理
 # 6) pq_audit.sh：counter 缺失不再触发 set -e 退出
 # 7) 配置统一化：写入 /usr/local/etc/xray/env.conf，子脚本统一读取（API_PORT 不再硬编码漂移）
 # 8) 端口分配：最小使用数 + 随机打散（避免热点偏向第一个端口）
+# 9) ✅ 修复“锁重入”问题：vless_rmu_one.sh 可复用父进程 fd=9 锁，GC/clear_all 不再假删除
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
@@ -352,7 +353,7 @@ EOF
 }
 
 install_temp_users_40ports() {
-  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（API/端口段统一读 env.conf + TTL失败检查timer + 端口分配随机打散）..."
+  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（含锁重入修复）..."
 
   cat >/root/vless_temp_audit_ipv4_all.sh <<'EOF'
 #!/usr/bin/env bash
@@ -378,7 +379,6 @@ set -euo pipefail
 
 ENV_CONF="/usr/local/etc/xray/env.conf"
 
-# defaults
 REALITY_DOMAIN="${REALITY_DOMAIN:-www.apple.com}"
 MAIN_PORT="${MAIN_PORT:-443}"
 API_HOST="${API_HOST:-127.0.0.1}"
@@ -391,7 +391,6 @@ if [[ -f "$ENV_CONF" ]]; then
   . "$ENV_CONF" || true
 fi
 
-# basic validate
 [[ "${API_PORT}" =~ ^[0-9]+$ ]] || API_PORT=10085
 [[ "${TEMP_PORT_START}" =~ ^[0-9]+$ ]] || TEMP_PORT_START=40000
 [[ "${TEMP_PORT_COUNT}" =~ ^[0-9]+$ ]] || TEMP_PORT_COUNT=40
@@ -402,7 +401,7 @@ export API_SERVER="${API_HOST}:${API_PORT}"
 LEN
 chmod +x /usr/local/sbin/vless_load_env.sh
 
-# ---- rmu ----
+# ---- rmu (✅锁重入修复版) ----
 cat >/usr/local/sbin/vless_rmu_one.sh <<'RMU'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -414,18 +413,36 @@ XRAY_BIN="/usr/local/bin/xray"
 DIR="/usr/local/etc/xray/tmpusers"
 LOCK="/var/lock/vless-tmpusers.lock"
 
-# ✅ 统一读取 API_HOST/API_PORT
-/usr/local/sbin/vless_load_env.sh
-API_SERVER="${API_SERVER}"
+# 统一读取 API_HOST/API_PORT
+if [[ -x /usr/local/sbin/vless_load_env.sh ]]; then
+  /usr/local/sbin/vless_load_env.sh
+  API_SERVER="${API_SERVER:-127.0.0.1:10085}"
+else
+  API_SERVER="127.0.0.1:10085"
+fi
 
-exec 9>"$LOCK"
+# ✅ 核心修复：
+# 如果 fd 9 已经存在且指向同一个 lock 文件（通常来自父进程 vless_gc / vless_clear_all 的继承），
+# 就不要重新 exec 9>"$LOCK"；直接 flock -n 9（会成功，不会自我冲突）。
+if [[ -e "/proc/$$/fd/9" ]]; then
+  FD9_TARGET="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+else
+  FD9_TARGET=""
+fi
+
+if [[ "$FD9_TARGET" != "$LOCK" ]]; then
+  exec 9>"$LOCK"
+fi
+
 flock -n 9 || { echo "❌ busy"; exit 1; }
 
+# API 删除（失败不致命：仍尝试清理本地 meta/json）
 "$XRAY_BIN" api rmu -s "$API_SERVER" -tag="$INBOUND_TAG" "$EMAIL" >/dev/null 2>&1 || true
 
+# 清理本地文件
 shopt -s nullglob
 for m in "$DIR"/*.meta; do
-  [ -f "$m" ] || continue
+  [[ -f "$m" ]] || continue
   if grep -q "EMAIL=$EMAIL" "$m"; then
     rm -f "$m" "${m%.meta}.json" 2>/dev/null || true
   fi
@@ -444,7 +461,7 @@ DIR="/usr/local/etc/xray/tmpusers"
 LOG="/var/log/vless-user.log"
 LOCK="/var/lock/vless-tmpusers.lock"
 
-# ✅ 统一读取 API_HOST/API_PORT + 端口范围
+# 统一读取 API_HOST/API_PORT + 端口范围
 /usr/local/sbin/vless_load_env.sh
 API_SERVER="${API_SERVER}"
 
@@ -460,11 +477,11 @@ if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
   echo "❌ D 必须是正整数秒"; exit 1
 fi
 
-# ✅ 提前检查 GC timer，避免 TTL 失败后没人回收
+# TTL 失败兜底依赖 timer：提前提示
 if ! systemctl is-enabled --quiet vless-gc.timer 2>/dev/null; then
-  echo "⚠️ vless-gc.timer 未启用：若 TTL unit 创建失败，过期节点可能无法自动回收。建议执行：systemctl enable --now vless-gc.timer" >&2
+  echo "⚠️ vless-gc.timer 未启用：若 TTL unit 创建失败，过期节点可能无法自动回收。建议：systemctl enable --now vless-gc.timer" >&2
 elif ! systemctl is-active --quiet vless-gc.timer 2>/dev/null; then
-  echo "⚠️ vless-gc.timer 未运行：建议执行：systemctl start vless-gc.timer" >&2
+  echo "⚠️ vless-gc.timer 未运行：建议：systemctl start vless-gc.timer" >&2
 fi
 
 declare -A cnt
@@ -477,7 +494,7 @@ while IFS= read -r p; do
   [[ -n "${cnt[$p]+x}" ]] && cnt[$p]=$((cnt[$p]+1))
 done < <(awk -F= '/^PORT=/{print $2}' "$DIR"/*.meta 2>/dev/null || true)
 
-# ✅ 最小使用数 + 随机打散（避免热点总落在最小端口）
+# 最小使用数 + 随机打散
 best_n=999999
 for ((i=0;i<TEMP_PORT_COUNT;i++)); do
   p=$((TEMP_PORT_START+i))
@@ -559,7 +576,7 @@ if ! systemd-run --quiet --collect --unit "$UNIT" --on-active="${D}s" \
   if systemctl enable --now vless-gc.timer >/dev/null 2>&1; then
     echo "✅ 已尝试启用并启动 vless-gc.timer" >&2
   else
-    echo "❌ 无法启用 vless-gc.timer，请手动检查 systemd/timer 环境，否则过期节点可能不回收。" >&2
+    echo "❌ 无法启用 vless-gc.timer，请手动检查 systemd/timer，否则过期节点可能不回收。" >&2
   fi
 fi
 
@@ -585,7 +602,7 @@ echo "$URL"
 MK
 chmod +x /usr/local/sbin/vless_mktemp.sh
 
-# ---- gc ----
+# ---- gc (父脚本持锁 + 调 rmu 子脚本；现在不会锁冲突) ----
 cat >/usr/local/sbin/vless_gc.sh <<'GC'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -625,7 +642,6 @@ DIR="/usr/local/etc/xray/tmpusers"
 LOG="/var/log/vless-user-restore.log"
 LOCK="/var/lock/vless-tmpusers.lock"
 
-# ✅ 统一读取 API_HOST/API_PORT
 /usr/local/sbin/vless_load_env.sh
 API_SERVER="${API_SERVER}"
 
@@ -668,7 +684,7 @@ done
 RS
 chmod +x /usr/local/sbin/vless_restore.sh
 
-# ---- audit / clear ----
+# ---- audit / clear_all (父脚本持锁 + 调 rmu 子脚本；现在不会锁冲突) ----
 cat >/usr/local/sbin/vless_audit.sh <<'AUD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -773,7 +789,7 @@ systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
 systemctl enable vless-restore.service >/dev/null 2>&1 || true
 systemctl start vless-restore.service >/dev/null 2>&1 || true
 
-echo "✅ 单进程 + 多端口 临时节点系统部署完成"
+echo "✅ 单进程 + 多端口 临时节点系统部署完成（含锁重入修复）"
 echo "用法：D=600 vless_mktemp.sh / vless_audit.sh / vless_clear_all.sh"
 EOF
 
@@ -878,7 +894,6 @@ DEL
 set -euo pipefail
 shopt -s nullglob
 
-# ✅ 修复：counter 不存在时不让脚本直接退出
 get_bytes() {
   local c="$1"
   nft list counter inet portquota "$c" 2>/dev/null \
@@ -961,13 +976,13 @@ main() {
   cat <<DONE
 
 ==================================================
-✅ 已生成全部脚本（含修复：API 端口不再漂移 / TTL失败检查timer / 端口分配随机打散）
+✅ 已生成全部脚本（含锁重入修复：GC/clear_all 不再假删除）
 - /root/onekey_reality_ipv4.sh
 - /root/vless_temp_audit_ipv4_all.sh
 
 建议顺序：
 1) update-all && reboot
-2) bash /root/onekey_reality_ipv4.sh     （会写 /usr/local/etc/xray/env.conf）
+2) bash /root/onekey_reality_ipv4.sh     （写 /usr/local/etc/xray/env.conf）
 3) bash /root/vless_temp_audit_ipv4_all.sh
 
 常用命令：
