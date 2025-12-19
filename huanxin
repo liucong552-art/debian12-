@@ -287,9 +287,9 @@ cat >"$CFG_DIR/config.json" <<CONF
     ]
   },
   "outbounds": [
-    { "tag": "${API_TAG}", "protocol": "api" },
     { "tag": "direct", "protocol": "freedom" },
-    { "tag": "block",  "protocol": "blackhole" }
+    { "tag": "block",  "protocol": "blackhole" },
+    { "tag": "${API_TAG}", "protocol": "api" }
   ]
 }
 CONF
