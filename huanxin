@@ -4,10 +4,13 @@ set -euo pipefail
 # Debian 12 一键生成脚本（稳定增强版：省CPU + 稳定优先）
 # 本版修复/增强：
 # 1) onekey_reality_ipv4.sh 变量定义顺序（set -u 不炸）
-# 2) Xray API outbound 缺失（adu/rmu 真可用）
+# 2) Xray API outbound 缺失（adu/rmu 真可用）+ outbounds 默认出口顺序修复（direct 第一）
 # 3) pq_add/pq_del 端口校验
 # 4) systemd-run TTL 失败不再静默吞掉
 # 5) /tmp 临时文件权限与清理
+# 6) need_basic_tools 的 apt-get update 不再吞错
+# 7) pq_audit.sh 在 counter 缺失时不再直接退出
+# 8) TEMP_PORT_START/COUNT 不再多处硬编码：统一写入 /usr/local/etc/xray/ports.env 并由 vless_mktemp.sh 读取
 
 REPO_BASE="https://raw.githubusercontent.com/liucong552-art/debian12-/main"
 UP_BASE="/usr/local/src/debian12-upstream"
@@ -30,7 +33,10 @@ check_debian12() {
 
 need_basic_tools() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y || apt-get update -y || true
+
+  # ✅ 修复：update 失败就退出，不再吞掉失败继续跑
+  apt-get update -y || apt-get update -y || { echo "❌ apt-get update 失败"; exit 1; }
+
   apt-get install -y \
     curl wget openssl python3 nftables coreutils logrotate ca-certificates iproute2 util-linux \
     || { echo "❌ apt 依赖安装失败"; exit 1; }
@@ -99,15 +105,13 @@ EOF
 }
 
 install_vless_script_singleproc_40ports() {
-  echo "🧩 写入 /root/onekey_reality_ipv4.sh（修复变量顺序 + 修复 API outbound）..."
+  echo "🧩 写入 /root/onekey_reality_ipv4.sh（修复变量顺序 + 修复 API outbound + outbounds 顺序）..."
 
-  # 头部：先写 shebang + set -euo
   cat >/root/onekey_reality_ipv4.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 EOF
 
-  # ✅ 修复#1：立刻注入常量，确保后续函数第一次使用时已定义
   cat >>/root/onekey_reality_ipv4.sh <<EOF
 REPO_BASE="${REPO_BASE}"
 UP_BASE="${UP_BASE}"
@@ -115,7 +119,6 @@ TEMP_PORT_START=${TEMP_PORT_START}
 TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
 EOF
 
-  # 其余逻辑：禁止生成时展开
   cat >>/root/onekey_reality_ipv4.sh <<'EOF'
 
 check_debian12() {
@@ -211,6 +214,14 @@ SHORT_ID="$(openssl rand -hex 8)"
 CFG_DIR=/usr/local/etc/xray
 mkdir -p "$CFG_DIR"
 
+# ✅ 统一端口范围配置：供 vless_mktemp.sh 读取，避免硬编码错配
+PORTS_ENV="${CFG_DIR}/ports.env"
+cat >"$PORTS_ENV" <<PE
+TEMP_PORT_START=${TEMP_PORT_START}
+TEMP_PORT_COUNT=${TEMP_PORT_COUNT}
+PE
+chmod 600 "$PORTS_ENV" 2>/dev/null || true
+
 TMP_INBOUNDS=""
 for i in $(seq 0 $((TEMP_PORT_COUNT-1))); do
   p=$((TEMP_PORT_START+i))
@@ -303,7 +314,6 @@ Restart=on-failure
 RestartSec=1
 OVR
 
-# 配置自检：坏配置不启动
 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 
 systemctl daemon-reload
@@ -328,7 +338,8 @@ else
   echo "$VLESS_URL" | base64 | tr -d '\n' >/root/v2ray_subscription_base64.txt
 fi
 
-echo "✅ 主节点完成：443 + 单进程 + 40 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
+echo "✅ 主节点完成：443 + 单进程 + ${TEMP_PORT_COUNT} 临时端口(${TEMP_PORT_START}-$((TEMP_PORT_START+TEMP_PORT_COUNT-1))) + API(${API_HOST}:${API_PORT})"
+echo "端口范围配置已写入：${PORTS_ENV}"
 echo "主节点链接："
 cat /root/vless_reality_vision_url.txt
 EOF
@@ -337,7 +348,7 @@ EOF
 }
 
 install_temp_users_40ports() {
-  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（TTL提示 + /tmp 改 mktemp 权限）..."
+  echo "🧩 写入 /root/vless_temp_audit_ipv4_all.sh（TTL提示 + /tmp 改 mktemp 权限 + 端口范围统一读取）..."
 
   cat >/root/vless_temp_audit_ipv4_all.sh <<'EOF'
 #!/usr/bin/env bash
@@ -407,8 +418,20 @@ if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
   echo "❌ D 必须是正整数秒"; exit 1
 fi
 
+# ✅ 修复：端口范围不再硬编码，统一从 ports.env 读取（没有则用默认值兜底）
+PORTS_ENV="/usr/local/etc/xray/ports.env"
 TEMP_PORT_START=40000
 TEMP_PORT_COUNT=40
+if [[ -f "$PORTS_ENV" ]]; then
+  # shellcheck disable=SC1090
+  . "$PORTS_ENV" || true
+fi
+
+# 校验端口范围
+if ! [[ "${TEMP_PORT_START}" =~ ^[0-9]+$ ]] || ! [[ "${TEMP_PORT_COUNT}" =~ ^[0-9]+$ ]] || (( TEMP_PORT_COUNT <= 0 )); then
+  echo "❌ ports.env 端口范围无效：TEMP_PORT_START=${TEMP_PORT_START} TEMP_PORT_COUNT=${TEMP_PORT_COUNT}"
+  exit 1
+fi
 
 declare -A cnt
 for ((i=0;i<TEMP_PORT_COUNT;i++)); do
@@ -694,7 +717,7 @@ systemctl enable --now vless-gc.timer >/dev/null 2>&1 || true
 systemctl enable vless-restore.service >/dev/null 2>&1 || true
 systemctl start vless-restore.service >/dev/null 2>&1 || true
 
-echo "✅ 单进程 + 40端口 临时节点系统部署完成"
+echo "✅ 单进程 + 多端口 临时节点系统部署完成"
 echo "用法：D=600 vless_mktemp.sh / vless_audit.sh / vless_clear_all.sh"
 EOF
 
@@ -739,7 +762,6 @@ set -euo pipefail
 PORT="${1:-}"; GIB="${2:-}"
 [[ -n "$PORT" && -n "$GIB" ]] || { echo "用法: pq_add.sh <端口> <GiB整数>"; exit 1; }
 
-# ✅ 修复：端口校验（避免误操作/awk 匹配扩大）
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "❌ 端口必须是数字"; exit 1; }
 (( PORT >= 1 && PORT <= 65535 )) || { echo "❌ 端口范围必须 1-65535"; exit 1; }
 
@@ -780,7 +802,6 @@ set -euo pipefail
 PORT="${1:-}"
 [[ -n "$PORT" ]] || { echo "用法: pq_del.sh <端口>"; exit 1; }
 
-# ✅ 修复：端口校验
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "❌ 端口必须是数字"; exit 1; }
 (( PORT >= 1 && PORT <= 65535 )) || { echo "❌ 端口范围必须 1-65535"; exit 1; }
 
@@ -801,11 +822,13 @@ DEL
 set -euo pipefail
 shopt -s nullglob
 
+# ✅ 修复：counter 不存在时不让脚本直接退出
 get_bytes() {
   local c="$1"
   nft list counter inet portquota "$c" 2>/dev/null \
     | awk '/bytes/{for(i=1;i<=NF;i++) if($i=="bytes"){print $(i+1); exit}}' \
-    | head -n1
+    | head -n1 \
+    || true
 }
 
 printf "%-8s %-10s %-12s %-12s %-8s %-12s %-12s\n" "PORT" "STATE" "USED(GiB)" "LIMIT(GiB)" "PERCENT" "ALLOW(GiB)" "DROP(GiB)"
