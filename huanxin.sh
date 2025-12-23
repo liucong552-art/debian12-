@@ -16,14 +16,18 @@ set -Eeuo pipefail
 # - /usr/local/bin/vless_quota_watch.sh
 # - /usr/local/bin/vless_quota_install_timer.sh
 #
-# 关键修复：
+# 关键修复（基于你真实安装踩坑）：
+# - mktemp：adi 必须 {"inbounds":[{...}]}（否则 no valid inbound found）
+# - mktemp：全流程 flock 独占（避免“报锁/但入站已创建或 state 没写”的不一致）
+# - mktemp：state 原子写入 + 去重（tmp+mv）
+# - quota_show/watch：对 null/非法 JSON 行完全容错，避免 set -u / ERR trap 报错
+# - quota_watch：不用 [[..]]&& / ((..))&& 这类会触发 ERR 的写法，统一 if
 # - 彻底避免 head -n1 在 pipefail 下触发 exit=141（统一改 sed -n '1p'）
 # - xray x25519 输出兼容 PublicKey / Password
 # - xray api 参数兼容（--server / -server / -s）
-# - mktemp 的 adi 失败时会打印 xray 原始报错，方便你定位
 # ============================================================
 
-SCRIPT_VER="2025-12-20+quota-fixed"
+SCRIPT_VER="2025-12-23+quota-fixed-final"
 export DEBIAN_FRONTEND=noninteractive
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -54,6 +58,7 @@ apt_install() {
 }
 
 ensure_deps() {
+  # util-linux 里带 flock；coreutils 里带 numfmt/shuf 等
   apt_install curl ca-certificates unzip jq openssl iproute2 coreutils util-linux
 }
 
@@ -225,7 +230,7 @@ write_main_config() {
   mkdir -p "$(dirname "$XRAY_CFG")" "$XRAY_LOG_DIR"
   backup_file "$XRAY_CFG"
 
-  # 重点：为了配额统计，开启 stats + policy.system.statsInboundUplink/Downlink
+  # 为配额统计开启 stats + policy.system.statsInboundUplink/Downlink
   cat >"$XRAY_CFG" <<JSON
 {
   "log": {
@@ -341,6 +346,7 @@ EOF
 }
 
 gen_temp_tools() {
+  # ✅ 修复后的 mktemp：全流程锁 + adi 正确结构 + state 原子去重
   write_bin /usr/local/bin/vless_mktemp.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -348,6 +354,7 @@ set -Eeuo pipefail
 ENV_FILE="/root/reality.env"
 STATE_FILE="/root/.vless_temp_inbounds.jsonl"
 XRAY_BIN="/usr/local/bin/xray"
+LOCK_FILE="/tmp/vless_mktemp.lock"
 
 trap 'echo -e "\n❌ 出错：exit=$?  行号=${LINENO}  命令：${BASH_COMMAND}\n" >&2' ERR
 
@@ -387,7 +394,6 @@ choose_port() {
 
 # 兼容多风格参数：--server / -server / -s
 xray_api_try() {
-  # usage: xray_api_try <subcmd> <args...>
   local sub="$1"; shift
   local out rc
 
@@ -407,78 +413,91 @@ vless_url() {
   echo "vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=tcp&headerType=none#${name}"
 }
 
+# ✅ 只保留 flock 锁：整个 mktemp 全流程独占
 with_lock() {
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"/tmp/vless_mktemp.lock"
-    flock -n 9 || die "正在有另一个 mktemp 在运行，请稍后再试"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "❌ 正在有另一个 mktemp 在运行，请稍后再试"
   fi
   "$@"
 }
 
+record_state() {
+  local tag="$1" port="$2" expires="$3" quota_bytes="$4"
+  local line tmp
+
+  line="$(jq -c -n \
+    --arg tag "$tag" \
+    --argjson port "$port" \
+    --argjson expires "$expires" \
+    --argjson quotaBytes "$quota_bytes" \
+    '{tag:$tag, port:$port, expires:$expires, quotaBytes:$quotaBytes}')"
+
+  mkdir -p "$(dirname "$STATE_FILE")"
+  touch "$STATE_FILE"
+
+  tmp="${STATE_FILE}.tmp.$$"
+  # 去重：同 tag / 同 port 的旧记录先剔除（用 -F 防止正则误伤）
+  grep -Fv "\"tag\":\"${tag}\"" "$STATE_FILE" | grep -Fv "\"port\":${port}" >"$tmp" || true
+  printf '%s\n' "$line" >>"$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
 main() {
-  local port tag tmp expires now quota_bytes
+  local port tag tmp_json expires now quota_bytes out url
+
   port="$(choose_port)"
   tag="temp-${port}"
-  tmp="/tmp/inbound_${tag}.json"
+  tmp_json="/tmp/inbound_${tag}.json"
   now="$(date +%s)"
   expires="$((now + D))"
   quota_bytes="$((Q * 1024 * 1024))"
 
-  # 生成动态入站 JSON（必须是合法 inbound 对象）
-  cat >"$tmp" <<JSON
+  # ✅ adi 需要 {"inbounds":[{...}]} 结构
+  cat >"$tmp_json" <<JSON
 {
-  "tag": "${tag}",
-  "listen": "0.0.0.0",
-  "port": ${port},
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      { "id": "${UUID}", "flow": "xtls-rprx-vision", "email": "${tag}" }
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "dest": "${DEST}",
-      "serverNames": ["${SNI}"],
-      "privateKey": "${PRIVATE_KEY}",
-      "shortIds": ["${SHORT_ID}"]
+  "inbounds": [
+    {
+      "tag": "${tag}",
+      "listen": "0.0.0.0",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${UUID}", "flow": "xtls-rprx-vision", "email": "${tag}" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "${DEST}",
+          "serverNames": ["${SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
     }
-  },
-  "sniffing": {
-    "enabled": true,
-    "destOverride": ["http", "tls", "quic"],
-    "routeOnly": true
-  }
+  ]
 }
 JSON
 
-  # 添加入站（失败就打印 xray 原始报错）
-  if ! out="$(xray_api_try adi "$tmp")"; then
+  if ! out="$(xray_api_try adi "$tmp_json")"; then
     echo "$out" >&2
     die "❌ 添加入站失败：xray api adi 调用失败（建议先自检：$XRAY_BIN api lsi --server=127.0.0.1:10085）"
   fi
 
-  # 记录状态（JSONL）
-  with_lock bash -c '
-    set -euo pipefail
-    line=$(jq -c -n \
-      --arg tag "'"$tag"'" \
-      --argjson port "'"$port"'" \
-      --argjson expires "'"$expires"'" \
-      --argjson quotaBytes "'"$quota_bytes"'" \
-      "{tag:\$tag, port:\$port, expires:\$expires, quotaBytes:\$quotaBytes}")
-    touch "'"$STATE_FILE"'"
-    echo "$line" >>"'"$STATE_FILE"'"
-  '
+  record_state "$tag" "$port" "$expires" "$quota_bytes"
 
   # 重置该 inbound 的统计（不强依赖）
   xray_api_try statsquery --pattern="inbound>>>${tag}>>>traffic>>>" --reset=true >/dev/null 2>&1 || true
 
-  # 输出节点
-  local url
   url="$(vless_url "$UUID" "$SERVER_IP" "$port" "$SNI" "${FP:-chrome}" "$PUBLIC_KEY" "$SHORT_ID" "${NAME}-${port}")"
   echo "$url" | tee "/root/vless_${tag}.txt" >/dev/null
 
@@ -488,14 +507,16 @@ JSON
   echo "$url"
   echo "----------------------------------------"
 
-  # 到期兜底删除（哪怕你不装 quota timer，也能到点清）
+  # 到期兜底删除
   if [[ "$D" -gt 0 ]]; then
     nohup bash -c "sleep ${D}; /usr/local/bin/vless_rmi_one.sh ${port} >/dev/null 2>&1" >/dev/null 2>&1 &
     ok "已后台定时删除：${D}s 后移除 port=${port}"
   fi
+
+  rm -f "$tmp_json" >/dev/null 2>&1 || true
 }
 
-main "$@"
+with_lock main "$@"
 EOF
 
   write_bin /usr/local/bin/vless_rmi_one.sh <<'EOF'
@@ -581,10 +602,11 @@ fi
 now="$(date +%s)"
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
-  port="$(echo "$line" | jq -r '.port')"
-  tag="$(echo "$line" | jq -r '.tag')"
-  exp="$(echo "$line" | jq -r '.expires')"
-  qbytes="$(echo "$line" | jq -r '.quotaBytes // 0')"
+  port="$(echo "$line" | jq -r '.port // 0' 2>/dev/null || echo 0)"
+  tag="$(echo "$line" | jq -r '.tag // empty' 2>/dev/null || true)"
+  exp="$(echo "$line" | jq -r '.expires // 0' 2>/dev/null || echo 0)"
+  qbytes="$(echo "$line" | jq -r '.quotaBytes // 0' 2>/dev/null || echo 0)"
+  [[ -n "$tag" ]] || continue
   left="$((exp - now))"; [[ "$left" -lt 0 ]] && left=0
   printf "port=%s tag=%s 剩余=%ss quotaBytes=%s\n" "$port" "$tag" "$left" "$qbytes"
 done <"$STATE_FILE"
@@ -600,7 +622,7 @@ if [[ ! -f "$STATE_FILE" ]]; then
   exit 0
 fi
 
-ports="$(jq -r '.port' "$STATE_FILE" 2>/dev/null || true)"
+ports="$(jq -r '.port // empty' "$STATE_FILE" 2>/dev/null || true)"
 if [[ -z "$ports" ]]; then
   rm -f "$STATE_FILE"
   echo "✅ 已清空状态文件"
@@ -618,6 +640,7 @@ EOF
 }
 
 gen_quota_tools() {
+  # ✅ 修复后的 quota_show：null-safe + to_int
   write_bin /usr/local/bin/vless_quota_show.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -641,8 +664,13 @@ xray_api_try() {
   return 1
 }
 
+to_int() {
+  local v="${1:-0}"
+  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
+
 fmt_bytes() {
-  local n="$1"
+  local n; n="$(to_int "${1:-0}")"
   if command -v numfmt >/dev/null 2>&1; then
     numfmt --to=iec --suffix=B "$n"
   else
@@ -655,29 +683,43 @@ fmt_bytes() {
 now="$(date +%s)"
 echo "tag | port | 剩余 | 已用 | 配额 | 状态"
 echo "---------------------------------------------------------------"
+
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
-  tag="$(echo "$line" | jq -r '.tag')"
-  port="$(echo "$line" | jq -r '.port')"
-  exp="$(echo "$line" | jq -r '.expires')"
-  qbytes="$(echo "$line" | jq -r '.quotaBytes // 0')"
-  left="$((exp - now))"; [[ "$left" -lt 0 ]] && left=0
 
-  used=0
-  json="$(xray_api_try statsquery --pattern="inbound>>>${tag}>>>traffic>>>" && true || true)"
+  tag="$(echo "$line" | jq -r '.tag // empty' 2>/dev/null || true)"
+  [[ -n "$tag" ]] || continue
+
+  port="$(to_int "$(echo "$line" | jq -r '.port // 0' 2>/dev/null || echo 0)")"
+  exp="$(to_int  "$(echo "$line" | jq -r '.expires // 0' 2>/dev/null || echo 0)")"
+  qbytes="$(to_int "$(echo "$line" | jq -r '.quotaBytes // 0' 2>/dev/null || echo 0)")"
+
+  left=$((exp - now)); (( left < 0 )) && left=0
+
+  json="$(xray_api_try statsquery --pattern="inbound>>>${tag}>>>traffic>>>" || true)"
+
+  up=0; down=0
   if [[ -n "${json:-}" ]]; then
-    up="$(echo "$json" | jq -r --arg t "$tag" '.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>uplink")) | .value' | sed -n '1p')"
-    down="$(echo "$json" | jq -r --arg t "$tag" '.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>downlink")) | .value' | sed -n '1p')"
-    up="${up:-0}"; down="${down:-0}"
-    used="$((up + down))"
+    up="$(echo "$json" | jq -r --arg t "$tag" \
+      '[.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>uplink")) | (.value|tonumber? // 0)] | add // 0' \
+      2>/dev/null | sed -n '1p' || true)"
+    down="$(echo "$json" | jq -r --arg t "$tag" \
+      '[.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>downlink")) | (.value|tonumber? // 0)] | add // 0' \
+      2>/dev/null | sed -n '1p' || true)"
   fi
 
+  up="$(to_int "$up")"
+  down="$(to_int "$down")"
+  used=$((up + down))
+
   status="OK"
-  if [[ "$qbytes" -gt 0 && "$used" -ge "$qbytes" ]]; then status="OVER"; fi
+  if (( qbytes > 0 && used >= qbytes )); then status="OVER"; fi
+
   echo "${tag} | ${port} | ${left}s | $(fmt_bytes "$used") | $(fmt_bytes "$qbytes") | ${status}"
 done <"$STATE_FILE"
 EOF
 
+  # ✅ 修复后的 quota_watch：ERR-trap safe + null-safe + 更保守（解析失败不删）
   write_bin /usr/local/bin/vless_quota_watch.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -705,6 +747,11 @@ xray_api_try() {
   return 1
 }
 
+to_int() {
+  local v="${1:-0}"
+  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
+
 lock_and_run() {
   if command -v flock >/dev/null 2>&1; then
     exec 9>"/tmp/vless_quota_watch.lock"
@@ -714,42 +761,64 @@ lock_and_run() {
 }
 
 run_once() {
-  [[ -f "$STATE_FILE" ]] || exit 0
-  local now tmp removed_any=0
+  [[ -s "$STATE_FILE" ]] || exit 0
+
+  local now tmp removed_any
   now="$(date +%s)"
   tmp="${STATE_FILE}.tmp.$$"
+  removed_any=0
   : >"$tmp"
 
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    tag="$(echo "$line" | jq -r '.tag')"
-    port="$(echo "$line" | jq -r '.port')"
-    exp="$(echo "$line" | jq -r '.expires')"
-    qbytes="$(echo "$line" | jq -r '.quotaBytes // 0')"
 
-    # 到期：兜底删除
-    if [[ "$now" -ge "$exp" ]]; then
+    # 解析失败/不是 JSON 就跳过（不要误删）
+    local tag port exp qbytes
+    tag="$(echo "$line" | jq -r '.tag // empty' 2>/dev/null || true)"
+    [[ -n "$tag" ]] || continue
+
+    port="$(to_int "$(echo "$line" | jq -r '.port // 0' 2>/dev/null || echo 0)")"
+    exp="$(to_int  "$(echo "$line" | jq -r '.expires // 0' 2>/dev/null || echo 0)")"
+    qbytes="$(to_int "$(echo "$line" | jq -r '.quotaBytes // 0' 2>/dev/null || echo 0)")"
+
+    # 端口不正常：保留记录但不做删除动作（避免误删）
+    if (( port <= 0 )); then
+      echo "$line" >>"$tmp"
+      continue
+    fi
+
+    # 到期删除
+    if (( exp > 0 && now >= exp )); then
+      warn "到期：tag=$tag port=$port -> 移除入站"
       /usr/local/bin/vless_rmi_one.sh "$port" >/dev/null 2>&1 || true
       removed_any=1
       continue
     fi
 
     # 无配额：保留
-    if [[ "$qbytes" -le 0 ]]; then
+    if (( qbytes <= 0 )); then
       echo "$line" >>"$tmp"
       continue
     fi
 
-    used=0
-    json="$(xray_api_try statsquery --pattern="inbound>>>${tag}>>>traffic>>>" && true || true)"
+    # statsquery 失败就当 0B（保守，不删）
+    local json up down used
+    json="$(xray_api_try statsquery --pattern="inbound>>>${tag}>>>traffic>>>" || true)"
+    up=0; down=0
     if [[ -n "${json:-}" ]]; then
-      up="$(echo "$json" | jq -r --arg t "$tag" '.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>uplink")) | .value' | sed -n '1p')"
-      down="$(echo "$json" | jq -r --arg t "$tag" '.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>downlink")) | .value' | sed -n '1p')"
-      up="${up:-0}"; down="${down:-0}"
-      used="$((up + down))"
+      up="$(echo "$json" | jq -r --arg t "$tag" \
+        '[.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>uplink")) | (.value|tonumber? // 0)] | add // 0' \
+        2>/dev/null | sed -n '1p' || true)"
+      down="$(echo "$json" | jq -r --arg t "$tag" \
+        '[.stat[]? | select(.name|contains("inbound>>>"+$t+">>>traffic>>>downlink")) | (.value|tonumber? // 0)] | add // 0' \
+        2>/dev/null | sed -n '1p' || true)"
     fi
 
-    if [[ "$used" -ge "$qbytes" ]]; then
+    up="$(to_int "$up")"
+    down="$(to_int "$down")"
+    used=$(( up + down ))
+
+    if (( used >= qbytes )); then
       warn "超限：tag=$tag port=$port used=${used} quota=${qbytes} -> 移除入站"
       /usr/local/bin/vless_rmi_one.sh "$port" >/dev/null 2>&1 || true
       removed_any=1
@@ -760,7 +829,11 @@ run_once() {
   done <"$STATE_FILE"
 
   mv -f "$tmp" "$STATE_FILE"
-  [[ "$removed_any" -eq 1 ]] && ok "本轮检查：已移除超限/到期入站"
+
+  # 这里必须用 if，别用 ((...)) &&，否则 removed_any=0 时会触发 ERR/误报
+  if (( removed_any == 1 )); then
+    ok "本轮检查：已移除超限/到期入站"
+  fi
 }
 
 lock_and_run run_once
