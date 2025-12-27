@@ -6,6 +6,11 @@
 # - nftables TCP 上行配额系统（自动持久化 + 5 分钟保存快照）
 # - 日志 logrotate：保留最近 2 天
 # - systemd journal：自动 vacuum 保留 2 天
+#
+# ✅ 已按你要求修改：让 xray.service 以 root 身份运行
+#    - 在 /root/onekey_reality_ipv4.sh 内写入 systemd drop-in:
+#      /etc/systemd/system/xray.service.d/99-run-as-root.conf
+#    - 解决你遇到的 “open /usr/local/etc/xray/config.json: permission denied”
 
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -179,6 +184,17 @@ install_xray_from_local_or_repo() {
   fi
 }
 
+# ✅ 强制 xray.service 以 root 运行（用 drop-in 覆盖 User=nobody）
+force_xray_run_as_root() {
+  mkdir -p /etc/systemd/system/xray.service.d
+  cat >/etc/systemd/system/xray.service.d/99-run-as-root.conf <<'DROPIN'
+[Service]
+User=root
+Group=root
+DROPIN
+  systemctl daemon-reload
+}
+
 check_debian12
 
 REALITY_DOMAIN="www.apple.com"
@@ -207,7 +223,11 @@ echo "当前拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/nul
 echo
 echo "=== 2. 安装 / 更新 Xray-core ==="
 install_xray_from_local_or_repo
-systemctl stop xray 2>/dev/null || true
+
+# ✅ 立刻覆盖成 root 跑（解决 config.json 600 权限导致 nobody 读不到的问题）
+force_xray_run_as_root
+
+systemctl stop xray.service 2>/dev/null || true
 
 echo
 echo "=== 3. 生成 UUID 与 Reality 密钥 ==="
@@ -281,13 +301,15 @@ cat >"$CONFIG_DIR/config.json" <<CONF
 }
 CONF
 
+# root 跑就没问题；仍保持 600（不让其它用户读）
+chown root:root "$CONFIG_DIR/config.json" 2>/dev/null || true
 chmod 600 "$CONFIG_DIR/config.json" 2>/dev/null || true
 
 systemctl daemon-reload
-systemctl enable xray || true
-systemctl restart xray
+systemctl enable xray.service || true
+systemctl restart xray.service
 sleep 2
-systemctl --no-pager --full status xray || true
+systemctl --no-pager --full status xray.service || true
 
 VLESS_URL="vless://${UUID}@${SERVER_IP}:${PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#${NODE_NAME}"
 
