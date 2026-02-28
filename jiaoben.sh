@@ -3,166 +3,125 @@ set -Eeuo pipefail
 IFS=$' \n\t'
 
 log(){ echo -e "\n[+] $*\n"; }
-warn(){ echo -e "\n[!] $*\n" >&2; }
 die(){ echo -e "\n[x] $*\n" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo -i"
 
-MODE="${MODE:-${1:-auto}}"
+# ====== 必填环境变量 ======
+# PANEL_HOST：面板 token-bridge 地址，例如 http://14.137.255.86:7002
+# API_KEY：面板 ApiKey（给节点用）
+# NODE_ID：面板节点 ID（例如 1）
+# =========================
+PANEL_HOST="${PANEL_HOST:-}"
+API_KEY="${API_KEY:-}"
+NODE_ID="${NODE_ID:-}"
+UPDATE_PERIODIC="${UPDATE_PERIODIC:-60}"
 
-# ===== 通用依赖 =====
-apt_install(){
-  apt-get update -y
-  apt-get install -y "$@"
-}
+# ====== 可选 ======
+GO_VER="${GO_VER:-1.25.3}"         # 默认 Go 1.25.3（可改）
+XRAYR_COMMIT="${XRAYR_COMMIT:-dd786ef}"  # #757 计量修复 commit
+SWAP_GB="${SWAP_GB:-2}"            # 内存小可自动加 swap（0=不加）
+# ==================
 
-# ===== 面板机：token-bridge =====
-panel_token_bridge(){
-  local UPSTREAM_HOST="${UPSTREAM_HOST:-127.0.0.1}"
-  local UPSTREAM_PORT="${UPSTREAM_PORT:-7001}"
-  local BRIDGE_PORT="${BRIDGE_PORT:-7002}"
-  local NODE_IP="${NODE_IP:-}"
-  [ -n "$NODE_IP" ] || read -rp "允许访问 token-bridge 的节点机 IP (例如 14.137.255.86): " NODE_IP
+[ -n "$PANEL_HOST" ] || die "缺少 PANEL_HOST，例如 http://14.137.255.86:7002"
+[ -n "$API_KEY" ]   || die "缺少 API_KEY（面板 ApiKey）"
+[ -n "$NODE_ID" ]   || die "缺少 NODE_ID（面板节点ID）"
 
-  # 面板机本机“走公网 IP 回环测试”时的来源 IP（避免你再遇到本机 curl 403）
-  local PANEL_IP="${PANEL_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)}"
-  [ -n "$PANEL_IP" ] || PANEL_IP="127.0.0.1"
+log "Step 0: 停掉旧服务（如果有）"
+systemctl stop XrayR 2>/dev/null || true
+systemctl disable XrayR 2>/dev/null || true
+systemctl stop xrayr 2>/dev/null || true
+systemctl disable xrayr 2>/dev/null || true
 
-  log "安装 nginx/curl/ca-certificates/jq"
-  apt_install nginx curl ca-certificates jq
+log "Step 1: 安装依赖（git/curl/jq/build-essential/iproute2/unzip）"
+apt-get update -y
+apt-get install -y git curl ca-certificates jq build-essential iproute2 unzip
 
-  # 删默认站点，避免 nginx 抢 80
-  rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default || true
-
-  log "检查上游是否监听：${UPSTREAM_HOST}:${UPSTREAM_PORT}"
-  if ! curl -fsS "http://${UPSTREAM_HOST}:${UPSTREAM_PORT}/" >/dev/null 2>&1; then
-    die "检测不到上游 http://${UPSTREAM_HOST}:${UPSTREAM_PORT}（请先保证 xboard 在本机 7001 可访问）"
+log "Step 1.1:（可选）内存太小就加 swap（避免 go build 被 killed）"
+if [ "${SWAP_GB}" != "0" ]; then
+  mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+  swap_kb="$(awk '/SwapTotal/{print $2}' /proc/meminfo)"
+  if [ "${mem_kb:-0}" -lt 1200000 ] && [ "${swap_kb:-0}" -eq 0 ]; then
+    log "检测到内存较小且无 swap，创建 ${SWAP_GB}G swapfile..."
+    fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB*1024))
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    free -h || true
   fi
+fi
 
-  log "写入 /etc/nginx/conf.d/xboard_token_bridge.conf （${BRIDGE_PORT} -> ${UPSTREAM_HOST}:${UPSTREAM_PORT}）"
-  cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<NG
-server {
-  listen 0.0.0.0:${BRIDGE_PORT};
-  server_name _;
+log "Step 2: 安装 Go ${GO_VER}"
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) go_arch="amd64" ;;
+  aarch64|arm64) go_arch="arm64" ;;
+  *) die "不支持的架构: $arch" ;;
+esac
 
-  # 只允许：节点机 + 面板机本机（127.0.0.1 + 面板机IP）
-  allow ${NODE_IP};
-  allow 127.0.0.1;
-  allow ${PANEL_IP};
-  deny all;
-
-  location / {
-    # token：优先 query token，其次 header Token
-    set \$token \$arg_token;
-    if (\$token = "") { set \$token \$http_token; }
-    if (\$token = "") { return 400; }
-
-    # 如果原请求没带 token=，就把 header Token 注入到 query
-    if (\$arg_token = "") { set \$args "\${args}&token=\${token}"; }
-    if (\$args ~ "^&")    { set \$args "token=\${token}"; }
-
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_set_header Host 127.0.0.1;
-
-    proxy_pass http://${UPSTREAM_HOST}:${UPSTREAM_PORT}\$uri?\$args;
-  }
-}
-NG
-
-  nginx -t
-  systemctl enable --now nginx
-  systemctl restart nginx
-
-  ss -lntp | grep ":${BRIDGE_PORT}" || true
-
-  cat <<EOF
-
-[+] DONE：面板机 token-bridge 已启用
-- token-bridge： http://${PANEL_IP}:${BRIDGE_PORT}  （公网用 ${PANEL_IP} / 104.224.158.191 替换）
-- 请在安全组放行：${BRIDGE_PORT}/tcp 仅允许 ${NODE_IP}
-
-自检（header 必须是 Token:xxx）：
-  KEY="你的ApiKey"
-  curl -sS -H "Token: \$KEY" "http://127.0.0.1:${BRIDGE_PORT}/api/v1/server/UniProxy/config?node_id=1&node_type=vless" | jq .
-  curl -sS -H "Token: \$KEY" "http://127.0.0.1:${BRIDGE_PORT}/api/v1/server/UniProxy/user?node_id=1&node_type=vless"   | jq .
-
-EOF
-}
-
-# ===== 节点机：按成功经验安装 XrayR（修复计量） =====
-install_go(){
-  local GO_VER="${GO_VER:-1.25.3}"
-  local arch go_arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) go_arch="amd64" ;;
-    aarch64|arm64) go_arch="arm64" ;;
-    *) die "不支持的架构: $arch" ;;
-  esac
-
-  if command -v go >/dev/null 2>&1 && go version | grep -q "go${GO_VER}"; then
-    return
+need_go_install="1"
+if command -v go >/dev/null 2>&1; then
+  if go version | grep -q "go${GO_VER}"; then
+    need_go_install="0"
   fi
+fi
 
-  log "安装 Go ${GO_VER}"
+if [ "$need_go_install" = "1" ]; then
   rm -rf /usr/local/go
-  local url1="https://go.dev/dl/go${GO_VER}.linux-${go_arch}.tar.gz"
-  local url2="https://dl.google.com/go/go${GO_VER}.linux-${go_arch}.tar.gz"
-  local tmp
-  tmp="$(mktemp -d)"
-  curl -fL --retry 5 --retry-delay 2 -o "$tmp/go.tgz" "$url1" || \
+  url1="https://go.dev/dl/go${GO_VER}.linux-${go_arch}.tar.gz"
+  url2="https://dl.google.com/go/go${GO_VER}.linux-${go_arch}.tar.gz"
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  log "下载 Go：$url1"
+  if ! curl -fL --retry 5 --retry-delay 2 -o "$tmp/go.tgz" "$url1"; then
+    log "go.dev 下载失败，改用 dl.google.com"
     curl -fL --retry 5 --retry-delay 2 -o "$tmp/go.tgz" "$url2"
+  fi
   tar -C /usr/local -xzf "$tmp/go.tgz"
-  rm -rf "$tmp"
-}
+fi
 
-node_install_xrayr(){
-  local PANEL_HOST="${PANEL_HOST:-}"
-  local NODE_ID="${NODE_ID:-}"
-  local API_KEY="${API_KEY:-}"
-  local UPDATE_PERIODIC="${UPDATE_PERIODIC:-60}"
-  local XRAYR_COMMIT="${XRAYR_COMMIT:-dd786ef}"
+export PATH="/usr/local/go/bin:$PATH"
+go version
 
-  [ -n "$PANEL_HOST" ] || read -rp "PANEL_HOST (例如 http://104.224.158.191:7002): " PANEL_HOST
-  [ -n "$NODE_ID" ] || read -rp "NODE_ID (例如 1): " NODE_ID
-  if [ -z "$API_KEY" ]; then
-    read -rsp "API_KEY(不回显): " API_KEY; echo
-  fi
+log "Step 3: 拉取 XrayR 并 checkout ${XRAYR_COMMIT}（含 #757 计量修复）"
+mkdir -p /usr/local/src
+if [ ! -d /usr/local/src/XrayR/.git ]; then
+  git clone https://github.com/XrayR-project/XrayR.git /usr/local/src/XrayR
+fi
+cd /usr/local/src/XrayR
+git fetch --all --tags
+git checkout -f "${XRAYR_COMMIT}"
 
-  log "安装依赖（git/curl/jq/build-essential/iproute2/unzip/ca-certificates）"
-  apt_install git curl ca-certificates jq build-essential iproute2 unzip
+log "Step 4: 打补丁（稳定性：users is null + Panel Start failed 不 panic）"
+# 4.1 Panel Start failed 不再 panic（避免面板偶发异常导致进程崩）
+if grep -q 'log.Panicf("Panel Start failed: %s", err)' panel/panel.go 2>/dev/null; then
+  sed -i 's/log\.Panicf("Panel Start failed: %s", err)/log.Errorf("Panel Start warning: %s", err)/' panel/panel.go
+fi
 
-  install_go
-  export PATH="/usr/local/go/bin:$PATH"
-  go version
+# 4.2 users is null：返回空切片指针（避免 fatal / 编译错误）
+if grep -q 'errors.New("users is null")' api/newV2board/v2board.go 2>/dev/null; then
+  sed -i 's/return nil, errors.New("users is null")/return \&[]api.UserInfo{}, nil/' api/newV2board/v2board.go
+fi
 
-  log "拉取 XrayR 源码并 checkout ${XRAYR_COMMIT}（这是我们成功修复计量的关键）"
-  mkdir -p /usr/local/src
-  if [ ! -d /usr/local/src/XrayR/.git ]; then
-    git clone https://github.com/XrayR-project/XrayR.git /usr/local/src/XrayR
-  fi
-  cd /usr/local/src/XrayR
-  git fetch --all --tags
-  git checkout -f "${XRAYR_COMMIT}"
+log "Step 5: 编译安装 XrayR（会下载 go modules，网络不稳可切 GOPROXY）"
+export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
+export GOSUMDB="${GOSUMDB:-sum.golang.org}"
 
-  log "打补丁（完全复刻我们成功经验：不 panic + users is null 返回空切片指针）"
-  # 1) Panel Start failed 不 panic
-  if grep -q 'log.Panicf("Panel Start failed: %s", err)' panel/panel.go 2>/dev/null; then
-    sed -i 's/log\.Panicf("Panel Start failed: %s", err)/log.Errorf("Panel Start warning: %s", err)/' panel/panel.go
-  fi
-  # 2) users is null -> return &[]api.UserInfo{}, nil   （必须是指针，避免你之前那个编译错误）
-  if grep -q 'errors.New("users is null")' api/newV2board/v2board.go 2>/dev/null; then
-    sed -i 's/return nil, errors.New("users is null")/return \&[]api.UserInfo{}, nil/' api/newV2board/v2board.go
-  fi
+# 先预下载依赖，失败则切换 goproxy.cn 再试一次
+if ! go mod download; then
+  log "go mod download 失败，切换 GOPROXY=goproxy.cn 并临时关闭 GOSUMDB 再试"
+  export GOPROXY="https://goproxy.cn,direct"
+  export GOSUMDB="off"
+  go clean -modcache || true
+  go mod download
+fi
 
-  log "编译安装 /usr/local/bin/xrayr"
-  go build -o XrayR -ldflags "-s -w" .
-  install -m 0755 XrayR /usr/local/bin/xrayr
+go build -o XrayR -ldflags "-s -w" .
+install -m 0755 XrayR /usr/local/bin/xrayr
 
-  log "写入 /etc/XrayR/config.yml（NodeType=Vless + CertConfig/REALITYConfigs 防 nil panic）"
-  mkdir -p /etc/XrayR
-  cat >/etc/XrayR/config.yml <<EOF
+log "Step 6: 写入 /etc/XrayR/config.yml（V2ray 类型 + EnableVless/XTLS）"
+mkdir -p /etc/XrayR
+cat >/etc/XrayR/config.yml <<EOF
 Log:
   Level: warning
 
@@ -179,7 +138,7 @@ Nodes:
       ApiHost: "${PANEL_HOST}"
       ApiKey: "${API_KEY}"
       NodeID: ${NODE_ID}
-      NodeType: Vless
+      NodeType: V2ray
       Timeout: 30
       EnableVless: true
       EnableXTLS: true
@@ -189,17 +148,19 @@ Nodes:
       SendIP: 0.0.0.0
       UpdatePeriodic: ${UPDATE_PERIODIC}
 
+      # 防 nil panic（你之前踩过）
       CertConfig:
         CertMode: none
       REALITYConfigs:
         Show: false
+      DisableLocalREALITYConfig: true
 EOF
 
-  log "写入 runner + systemd（StartLimitIntervalSec 放在 [Unit]，避免你之前那种无效配置）"
-  install -d /var/log/XrayR
-  : > /var/log/XrayR/runner.log
+log "Step 6.1: runner（稳定重启，不触发 StartLimit）"
+install -d /var/log/XrayR
+: > /var/log/XrayR/runner.log
 
-  cat >/usr/local/bin/xrayr-runner <<'EOF'
+cat >/usr/local/bin/xrayr-runner <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 mkdir -p /var/log/XrayR
@@ -213,9 +174,10 @@ while true; do
   sleep 3
 done
 EOF
-  chmod +x /usr/local/bin/xrayr-runner
+chmod +x /usr/local/bin/xrayr-runner
 
-  cat >/etc/systemd/system/xrayr.service <<'EOF'
+log "Step 6.2: systemd（StartLimitIntervalSec 必须在 [Unit]）"
+cat >/etc/systemd/system/xrayr.service <<'EOF'
 [Unit]
 Description=XrayR Service (stable runner)
 After=network-online.target
@@ -233,47 +195,42 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now xrayr
-  systemctl restart xrayr
+systemctl daemon-reload
+systemctl enable --now xrayr
+systemctl restart xrayr
 
-  log "自检：从面板拉 config/user（header 必须 Token:xxx）"
-  curl -sS -H "Token: ${API_KEY}" \
-    "${PANEL_HOST}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=vless" | jq . || true
-  curl -sS -H "Token: ${API_KEY}" \
-    "${PANEL_HOST}/api/v1/server/UniProxy/user?node_id=${NODE_ID}&node_type=vless" | jq . || true
+log "Step 7: 自检（拉 config/user + 检查监听端口）"
+echo "[i] 拉 config："
+cfg="$(curl -fsS -H "Token: ${API_KEY}" \
+  "${PANEL_HOST}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=vless" || true)"
+echo "$cfg" | jq . || true
 
-  echo
-  systemctl status xrayr --no-pager -l | sed -n '1,18p' || true
-  tail -n 120 /var/log/XrayR/runner.log || true
+port="$(echo "$cfg" | jq -r '.server_port // empty' 2>/dev/null || true)"
+echo "[i] server_port=${port:-NA}"
 
-  cat <<EOF
+echo "[i] 拉 user："
+curl -fsS -H "Token: ${API_KEY}" \
+  "${PANEL_HOST}/api/v1/server/UniProxy/user?node_id=${NODE_ID}&node_type=vless" | jq . || true
 
-==================== ✅ 节点机完成（按成功经验修复计量） ====================
+echo
+systemctl status xrayr --no-pager -l | sed -n '1,20p' || true
+tail -n 120 /var/log/XrayR/runner.log || true
 
-- 关键：源码 checkout ${XRAYR_COMMIT} + Go 编译（不是 release latest）
-- runner：tail -n 200 /var/log/XrayR/runner.log
-- 服务：systemctl status xrayr
+if [ -n "${port:-}" ]; then
+  ss -lntp | grep ":${port}" || echo "[!] 未发现监听 :${port}（请看 runner.log）"
+fi
 
-注意：
-- UPDATE_PERIODIC 建议 60（不要太低，会放大 users=null/抖动概率）
-- 如果你在 Windows 里复制粘贴大量输出到 SSH，会把“Windows PowerShell”文字也发到 Linux 里导致脚本乱掉
+cat <<EOF
+
+==================== ✅ 节点机完成（修复 Vision/REALITY 计量） ====================
+
+- 运行版本：XrayR commit ${XRAYR_COMMIT}（#757：禁用 splice copy，修复 usage report） 
+- runner 日志：tail -n 200 /var/log/XrayR/runner.log
+- systemd：systemctl status xrayr
+
+下一步：
+- 云防火墙/安全组放行 server_port（例如 8443/tcp）
+
+===============================================================================
 
 EOF
-}
-
-auto_mode(){
-  # 如果本机有 xboard(7001)，默认当面板机；否则当节点机
-  if curl -fsS "http://127.0.0.1:7001/" >/dev/null 2>&1; then
-    MODE="panel"
-  else
-    MODE="node"
-  fi
-}
-
-case "$MODE" in
-  panel) panel_token_bridge ;;
-  node) node_install_xrayr ;;
-  auto|"") auto_mode; "$0" "$MODE" ;;
-  *) die "未知 MODE=$MODE（可用：MODE=panel 或 MODE=node）" ;;
-esac
