@@ -1,34 +1,56 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-############################################
-# XrayR NewV2board(VLESS/REALITY/Vision) one-key
-# - Debian 12
-# - token-bridge nginx: 127.0.0.1:7002 -> 127.0.0.1:7001
-# - patches:
-#   1) Panel Start panic -> error + return (avoid crash loop)
-#   2) users empty -> return &[]api.UserInfo{}, nil (avoid "users is null" fatal)
-#   3) NodeInfo returns -> ensure "return x" becomes "return x, nil" for (*api.NodeInfo, error)
-# - config.yml补齐 CertConfig/REALITYConfigs 避免 nil panic
-############################################
-
-LOG="/var/log/xrayr_onekey.log"
-mkdir -p "$(dirname "$LOG")"
+LOG=/var/log/xrayr_onekey.log
+mkdir -p /var/log
+touch "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "[+] Start: $(date) | log: $LOG"
 
-# -------- helpers --------
-die(){ echo "[!] $*" >&2; exit 1; }
-need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Please run as root"; }
+# ========= 可改默认值 =========
+XRAYR_REPO_DEFAULT="https://github.com/XrayR-project/XrayR.git"
+# 这里不要再写 dd786ef 这种短 hash 了（容易不可达）
+# 默认用 master；你也可以运行时输入成 tag/commit/fullhash
+XRAYR_REF_DEFAULT="master"
 
-# 自动去 CRLF（即使你是 Windows 编辑上传，也不会炸）
-strip_crlf_self() {
-  # 仅处理可读脚本文件
-  if [[ -f "${BASH_SOURCE[0]}" && -w "${BASH_SOURCE[0]}" ]]; then
-    sed -i 's/\r$//' "${BASH_SOURCE[0]}" || true
+BRIDGE_LISTEN="127.0.0.1:7002"
+PANEL_ORIGIN="http://127.0.0.1:7001"
+APIHOST="http://127.0.0.1:7002"
+
+# UpdatePeriodic 别太低（避免面板偶发空返回放大）
+UPDATE_PERIODIC_DEFAULT=60
+
+# 监听端口建议 8443
+NODE_PORT_DEFAULT=8443
+
+# ========= 工具函数 =========
+die(){ echo "[!] $*" >&2; exit 1; }
+ok(){ echo "[*] $*"; }
+
+need_root() { [[ "${EUID}" -eq 0 ]] || die "Please run as root"; }
+
+ask() {
+  local prompt="$1" default="${2:-}"
+  local v
+  if [[ -n "$default" ]]; then
+    read -r -p "[?] ${prompt} (default: ${default}): " v
+    echo "${v:-$default}"
+  else
+    read -r -p "[?] ${prompt}: " v
+    echo "$v"
   fi
 }
+
+ask_secret() {
+  local prompt="$1"
+  local v
+  read -r -s -p "[?] ${prompt} (input hidden): " v
+  echo
+  echo "$v"
+}
+
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
@@ -36,236 +58,160 @@ apt_install() {
   apt-get install -y --no-install-recommends "$@"
 }
 
-# -------- begin --------
+# ========= 0) 基础依赖 =========
 need_root
-strip_crlf_self
-
-# ====== configurable vars (can override by env) ======
-# xboard api host（容器在本机，用 127.0.0.1:7001）
-PANEL_HOST="${PANEL_HOST:-http://127.0.0.1:7001}"
-
-# nginx token bridge listen
-BRIDGE_LISTEN_IP="${BRIDGE_LISTEN_IP:-127.0.0.1}"
-BRIDGE_PORT="${BRIDGE_PORT:-7002}"
-
-# XrayR listen port（面板下发也会是 8443，脚本不强绑）
-DEFAULT_NODE_PORT="${DEFAULT_NODE_PORT:-8443}"
-
-# Update periodic (avoid users=null storm)
-UPDATE_PERIODIC="${UPDATE_PERIODIC:-60}"
-
-# XrayR git
-XRAYR_REPO="${XRAYR_REPO:-https://github.com/XrayR-project/XrayR.git}"
-XRAYR_COMMIT="${XRAYR_COMMIT:-dd786ef}"
-
-# Node config
-NODE_ID="${NODE_ID:-}"
-API_KEY="${API_KEY:-}"
-
-echo "[*] Basic deps..."
+ok "Basic deps..."
 apt_install ca-certificates curl jq perl iproute2 tar cron util-linux git patch
 
-# ====== Ask for NODE_ID / API_KEY if not provided ======
-if [[ -z "${NODE_ID}" ]]; then
-  read -r -p "[?] Enter NodeID (e.g. 1): " NODE_ID
-fi
-if [[ -z "${API_KEY}" ]]; then
-  read -r -s -p "[?] Enter ApiKey (input hidden): " API_KEY
-  echo
-fi
-[[ -n "$NODE_ID" ]] || die "NODE_ID is empty"
-[[ -n "$API_KEY" ]] || die "API_KEY is empty"
-echo "[*] NodeID=$NODE_ID  ApiKeyLen=${#API_KEY}"
+# ========= 1) 交互输入 =========
+NODE_ID="$(ask "Enter NodeID (e.g. 1)" "")"
+[[ -n "$NODE_ID" ]] || die "NodeID required"
 
-# ====== nginx token-bridge ======
-echo "[*] Installing nginx token-bridge (${BRIDGE_LISTEN_IP}:${BRIDGE_PORT} -> ${PANEL_HOST})..."
+API_KEY="$(ask_secret "Enter ApiKey")"
+[[ -n "$API_KEY" ]] || die "ApiKey required"
+
+XRAYR_REPO="$(ask "Enter XrayR repo" "$XRAYR_REPO_DEFAULT")"
+XRAYR_REF="$(ask "Enter XrayR ref (branch/tag/full commit hash preferred)" "$XRAYR_REF_DEFAULT")"
+
+UPDATE_PERIODIC="$(ask "Enter UpdatePeriodic seconds" "$UPDATE_PERIODIC_DEFAULT")"
+NODE_PORT="$(ask "Enter node listen port" "$NODE_PORT_DEFAULT")"
+
+ok "NodeID=$NODE_ID  ApiKeyLen=${#API_KEY}  Repo=$XRAYR_REPO  Ref=$XRAYR_REF  UpdatePeriodic=$UPDATE_PERIODIC  Port=$NODE_PORT"
+
+# ========= 2) nginx token bridge =========
+ok "Installing nginx token-bridge (${BRIDGE_LISTEN} -> ${PANEL_ORIGIN})..."
 apt_install nginx
 
-# 删除默认站点（避免占用 80）
+# 删掉默认站点，避免占 80
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default || true
 
-cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<NG
+cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<'NG'
 server {
-  listen ${BRIDGE_LISTEN_IP}:${BRIDGE_PORT};
+  listen 127.0.0.1:7002;
   server_name _;
 
   location / {
-    # token: query token first, then header Token
-    set \$token \$arg_token;
-    if (\$token = "") { set \$token \$http_token; }
-    if (\$token = "") { return 400; }
+    # token: 优先 query token，其次 Header Token
+    set $token $arg_token;
+    if ($token = "") { set $token $http_token; }
+    if ($token = "") { return 400; }
 
-    # inject token into query if missing
-    if (\$arg_token = "") { set \$args "\${args}&token=\${token}"; }
-    if (\$args ~ "^&")    { set \$args "token=\${token}"; }
+    # 若原请求没带 token=，把 header token 注入 query
+    if ($arg_token = "") { set $args "${args}&token=${token}"; }
+    if ($args ~ "^&")    { set $args "token=${token}"; }
 
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_set_header Host 127.0.0.1;
 
-    proxy_pass ${PANEL_HOST}\$uri?\$args;
+    proxy_pass http://127.0.0.1:7001$uri?$args;
   }
 }
 NG
 
 nginx -t
-systemctl enable --now nginx || true
-systemctl restart nginx
-echo "[*] nginx listening check:"
-ss -lntp | grep ":${BRIDGE_PORT}" || die "nginx not listening on ${BRIDGE_LISTEN_IP}:${BRIDGE_PORT}"
+systemctl enable --now nginx
+systemctl reload nginx
 
-# ====== cron: xboard schedule run (if container exists) ======
-echo "[*] Setup cron for xboard schedule (if container exists)..."
-systemctl enable --now cron || true
-if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -q '^xboard-web-1$'; then
-  cat >/etc/cron.d/xboard-schedule <<'EOF'
+ok "nginx listening check:"
+ss -lntp | grep ':7002' || die "nginx token-bridge not listening on 7002"
+
+# ========= 3) xboard schedule cron =========
+ok "Setup cron for xboard schedule (if container exists)..."
+cat >/etc/cron.d/xboard-schedule <<'EOF'
 * * * * * root flock -n /tmp/xboard_schedule.lock docker exec xboard-web-1 php artisan schedule:run --no-interaction >>/var/log/xboard_schedule.log 2>&1
 EOF
-  chmod 644 /etc/cron.d/xboard-schedule
-  touch /var/log/xboard_schedule.log
-  echo "[*] xboard schedule cron installed: /etc/cron.d/xboard-schedule"
-else
-  echo "[!] docker/xboard-web-1 not found, skip schedule cron (you can add later)."
-fi
+chmod 644 /etc/cron.d/xboard-schedule
+touch /var/log/xboard_schedule.log
+systemctl enable --now cron || true
+ok "xboard schedule cron installed: /etc/cron.d/xboard-schedule"
 
-# ====== install Go ======
-echo "[*] Installing Go..."
+# ========= 4) Go 安装 =========
+ok "Installing Go..."
+# 用 go.dev 官方下载（你之前用的 1.25.3 没问题）
+GO_VER="1.25.3"
+GO_TAR="go${GO_VER}.linux-amd64.tar.gz"
+GO_URL="https://go.dev/dl/${GO_TAR}"
+
 apt_install curl
-GO_TARBALL_URL="${GO_TARBALL_URL:-https://go.dev/dl/go1.25.3.linux-amd64.tar.gz}"
-if [[ ! -x /usr/local/go/bin/go ]]; then
-  rm -rf /usr/local/go
-  curl -fsSL "$GO_TARBALL_URL" -o /tmp/go.tgz
-  tar -C /usr/local -xzf /tmp/go.tgz
-fi
+rm -rf /usr/local/go
+curl -fL "$GO_URL" -o "/tmp/${GO_TAR}"
+tar -C /usr/local -xzf "/tmp/${GO_TAR}"
+rm -f "/tmp/${GO_TAR}"
+
 export PATH=/usr/local/go/bin:$PATH
-command -v go >/dev/null || die "go not found"
-command -v gofmt >/dev/null || die "gofmt not found"
-go version
+cmd_exists go || die "go not found after install"
+cmd_exists gofmt || die "gofmt not found after install"
+ok "$(go version)"
 
-# goproxy fallback（避免某些环境拉依赖慢/卡）
-export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
-export GOSUMDB="${GOSUMDB:-sum.golang.org}"
-export GO111MODULE=on
-
-# ====== build-essential (compile deps) ======
-echo "[*] Installing build deps..."
+# ========= 5) build deps =========
+ok "Installing build deps..."
 apt_install build-essential
 
-# ====== clone + checkout ======
-echo "[*] Cloning XrayR..."
+# ========= 6) clone XrayR（不再浅克隆） =========
+ok "Cloning XrayR..."
 rm -rf /usr/local/src/XrayR
-git clone --depth 1 "$XRAYR_REPO" /usr/local/src/XrayR
+git clone "$XRAYR_REPO" /usr/local/src/XrayR
 cd /usr/local/src/XrayR
-git fetch --depth 1 origin "$XRAYR_COMMIT"
-git checkout "$XRAYR_COMMIT"
-echo "[*] Checked out: $(git rev-parse --short HEAD)"
+git fetch --all --tags
 
-# ====== Patch 1: Panel Start panic -> error + return ======
-echo "[*] Patch 1/3: Panel Start panic -> error+return"
-# 把 log.Panicf("Panel Start failed: %s", err) 改为 log.Errorf + return
-# 兼容不同空格/缩进
-perl -pi -e '
-  if (/log\.Panicf\("Panel Start failed: %s",\s*err\)/) {
-    s/log\.Panicf\("Panel Start failed: %s",\s*err\)/log.Errorf("Panel Start warning: %s", err)\n\t\t\t\treturn/;
-  }
-' panel/panel.go || true
+# ref 既可以是 branch/tag，也可以是 commit/fullhash
+if git show-ref --verify --quiet "refs/heads/$XRAYR_REF"; then
+  git checkout -q "$XRAYR_REF"
+elif git show-ref --verify --quiet "refs/tags/$XRAYR_REF"; then
+  git checkout -q "tags/$XRAYR_REF"
+elif git cat-file -e "${XRAYR_REF}^{commit}" 2>/dev/null; then
+  git checkout -q "$XRAYR_REF"
+else
+  # 如果是短 hash，尝试补全
+  FULL=$(git rev-list --all | grep -i "^${XRAYR_REF}" | head -n 1 || true)
+  [[ -n "$FULL" ]] || die "XRAYR_REF=$XRAYR_REF not found in repo history"
+  git checkout -q "$FULL"
+fi
 
-# ====== Patch 2: users empty -> &[]api.UserInfo{}, nil ======
-echo "[*] Patch 2/3: newV2board users empty -> &empty, nil"
-# 目标块（你已看到在 234-238 行附近）：
-# if len(users) == 0 { return nil, errors.New("users is null") }
-# 替换为：
-# if len(users) == 0 { empty := []api.UserInfo{}; return &empty, nil }
-perl -0777 -pi -e '
-  s/if\s+len\(users\)\s*==\s*0\s*\{\s*return\s+nil,\s*errors\.New\("users is null"\)\s*\}/if len(users) == 0 {\n\t\tempty := []api.UserInfo{}\n\t\treturn \&empty, nil\n\t}/s;
-  s/if\s+len\(users\)\s*==\s*0\s*\{\s*return\s+\[\]api\.UserInfo\{\},\s*nil\s*\}/if len(users) == 0 {\n\t\tempty := []api.UserInfo{}\n\t\treturn \&empty, nil\n\t}/s;
-' api/newV2board/v2board.go
+ok "Checked out: $(git rev-parse --short HEAD)"
 
-# ====== Patch 3: NodeInfo "return x" -> "return x, nil" (only for (*api.NodeInfo, error) funcs) ======
-echo "[*] Patch 3/3: fix NodeInfo not-enough-return-values"
-python3 - <<'PY'
-import re, pathlib, sys
-p = pathlib.Path("api/newV2board/v2board.go")
-s = p.read_text(encoding="utf-8")
+# ========= 7) 打补丁（最小、确定、可重复） =========
+ok "Patching: panel start panic -> error+return"
+# panel/panel.go: log.Panicf("Panel Start failed: %s", err) -> log.Errorf(...); return err
+# 注意：不同版本可能略有出入，这里做两步替换：先改 Panicf，再补 return
+if grep -q 'Panel Start failed' panel/panel.go; then
+  # 先把 Panicf 替换成 Errorf
+  perl -pi -e 's/log\.Panicf\("Panel Start failed: %s",\s*err\)/log.Errorf("Panel Start warning: %s", err)/g' panel/panel.go
+  # 如果紧跟着没有 return err，就在下一行补一个（只在出现 Start failed 的分支里补）
+  # 这里用一个相对安全的方式：在包含 "Panel Start warning" 的行后插入 return err（若已存在则不会重复）
+  perl -0777 -pi -e 's/(Panel Start warning: %s", err\)\s*;\s*)(?!return err;)/$1return err;\n/g' panel/panel.go
+fi
 
-# 找到所有返回签名为 (*api.NodeInfo, error) 的函数块，并把其中：
-#   return <expr>
-# 且 <expr> 不含逗号、不为 nil
-# 替换成：
-#   return <expr>, nil
-def fix_block(m):
-    head = m.group(1)
-    body = m.group(2)
-    # 只修 "return xxx"（无逗号）且非 "return nil"
-    body2 = re.sub(r'(\n[ \t]*return[ \t]+)(?!nil\b)([^,\n]+?)([ \t]*\n)',
-                   r'\1\2, nil\3', body)
-    return head + body2 + "\n}"
+ok "Patching: newV2board users empty -> &empty, nil"
+# api/newV2board/v2board.go: if len(users)==0 { return ..., errors.New("users is null") } -> return &empty, nil
+if [[ -f api/newV2board/v2board.go ]]; then
+  # 仅替换 len(users)==0 这个 if 块（精准替换，避免把别的 return 搞坏）
+  perl -0777 -pi -e '
+    s/if\s+len\(users\)\s*==\s*0\s*\{\s*return\s+[^;]*?errors\.New\("users is null"\)\s*\}/if len(users) == 0 {\n\t\tempty := make([]api.UserInfo, 0)\n\t\treturn \&empty, nil\n\t}/s
+  ' api/newV2board/v2board.go
 
-pattern = re.compile(r'(func[ \t]+[^{]*\(\*api\.NodeInfo,[ \t]*error\)[ \t]*\{\n)(.*?\n)\}', re.S)
-s2 = pattern.sub(fix_block, s)
+  # 兼容有些版本写成 return []api.UserInfo{}, nil 这种（类型不对）
+  perl -0777 -pi -e '
+    s/if\s+len\(users\)\s*==\s*0\s*\{\s*return\s+\[\]api\.UserInfo\{\}\s*,\s*nil\s*\}/if len(users) == 0 {\n\t\tempty := make([]api.UserInfo, 0)\n\t\treturn \&empty, nil\n\t}/s
+  ' api/newV2board/v2board.go
+fi
 
-if s2 == s:
-    # 没匹配到也不算失败，但给个提示
-    print("[WARN] No (*api.NodeInfo, error) func blocks matched; skip NodeInfo return patch")
-else:
-    p.write_text(s2, encoding="utf-8")
-    print("[OK] Patched NodeInfo return statements")
-PY
+ok "Running gofmt..."
+gofmt -w panel/panel.go api/newV2board/v2board.go || true
 
-# gofmt
-gofmt -w api/newV2board/v2board.go panel/panel.go || true
-
-# ====== Build ======
-echo "[*] Building XrayR (deps download may take time)..."
+# ========= 8) 编译 =========
+ok "Building XrayR... (may take time, log continues here)"
 go build -o XrayR -ldflags "-s -w" .
-install -m 755 XrayR /usr/local/bin/xrayr
 
-# ====== Install runner + systemd ======
-echo "[*] Installing runner + systemd..."
+# ========= 9) 安装二进制 + 目录 =========
+ok "Installing binaries..."
+install -m 755 XrayR /usr/local/bin/xrayr
 mkdir -p /etc/XrayR /var/log/XrayR
 touch /var/log/XrayR/runner.log
 
-cat >/usr/local/bin/xrayr-runner <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-LOG="/var/log/XrayR/runner.log"
-BIN="/usr/local/bin/xrayr"
-CFG="/etc/XrayR/config.yml"
-
-mkdir -p "$(dirname "$LOG")"
-touch "$LOG"
-
-while true; do
-  ts="$(date -Is)"
-  echo "[runner] start $ts" >>"$LOG" || true
-  "$BIN" --config "$CFG" >>"$LOG" 2>&1 || true
-  ts2="$(date -Is)"
-  echo "[runner] xrayr exited at $ts2, retry in 3s" >>"$LOG" || true
-  sleep 3
-done
-EOF
-chmod +x /usr/local/bin/xrayr-runner
-
-cat >/etc/systemd/system/xrayr.service <<'EOF'
-[Unit]
-Description=XrayR Service (stable runner)
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/xrayr-runner
-Restart=always
-RestartSec=2
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ====== Write config.yml ======
-echo "[*] Writing /etc/XrayR/config.yml"
+# ========= 10) 写 config.yml =========
+ok "Writing /etc/XrayR/config.yml (Vless + Reality/Vision safe defaults)..."
 cat >/etc/XrayR/config.yml <<EOF
 Log:
   Level: info
@@ -279,7 +225,7 @@ OutboundConfigPath:
 
 ConnetionConfig:
   Handshake: 4
-  ConnIdle: 60
+  ConnIdle: 30
   UplinkOnly: 2
   DownlinkOnly: 4
   BufferSize: 64
@@ -287,7 +233,7 @@ ConnetionConfig:
 Nodes:
   - PanelType: "NewV2board"
     ApiConfig:
-      ApiHost: "http://${BRIDGE_LISTEN_IP}:${BRIDGE_PORT}"
+      ApiHost: "${APIHOST}"
       ApiKey: "${API_KEY}"
       NodeID: ${NODE_ID}
       NodeType: Vless
@@ -298,40 +244,88 @@ Nodes:
       SpeedLimit: 0
       DeviceLimit: 0
       RuleListPath:
-      DisableCustomConfig: false
-
     ControllerConfig:
       ListenIP: "0.0.0.0"
       SendIP: "0.0.0.0"
       UpdatePeriodic: ${UPDATE_PERIODIC}
-
-      # 避免 nil panic
-      CertConfig:
-        CertMode: none
+      EnableDNS: false
+      DNSType: AsIs
+      EnableProxyProtocol: false
+      EnableFallback: false
+      DisableSniffing: true
+      FallBackConfigs: []
+      EnableREALITY: true
       REALITYConfigs:
         Show: false
+        Dest: "www.apple.com:443"
+        ProxyProtocolVer: 0
+        ServerNames:
+          - "www.apple.com"
+        PrivateKey: ""
+        ShortIds:
+          - ""
+      CertConfig:
+        CertMode: none
+        CertDomain: ""
+        CertFile: ""
+        KeyFile: ""
 EOF
 
-# ====== start service ======
-echo "[*] Start xrayr.service..."
+# ========= 11) runner + systemd =========
+ok "Installing runner + systemd service..."
+
+cat >/usr/local/bin/xrayr-runner <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+LOG=/var/log/XrayR/runner.log
+mkdir -p /var/log/XrayR
+touch "$LOG"
+
+while true; do
+  /usr/local/bin/xrayr -c /etc/XrayR/config.yml >>"$LOG" 2>&1 || true
+  echo "[runner] xrayr exited at $(date --iso-8601=seconds), retry in 3s" >>"$LOG"
+  sleep 3
+done
+EOF
+chmod +x /usr/local/bin/xrayr-runner
+
+cat >/etc/systemd/system/xrayr.service <<'EOF'
+[Unit]
+Description=XrayR Service (stable runner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xrayr-runner
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now xrayr
+systemctl restart xrayr
 
-sleep 2
-echo "[*] Status:"
+ok "Service status:"
 systemctl status xrayr --no-pager -l || true
-echo "[*] Listening ports:"
-ss -lntp | grep -E ":${DEFAULT_NODE_PORT}|xrayr|${BRIDGE_PORT}" || true
 
-# ====== quick api sanity ======
-echo "[*] Quick API sanity via bridge (should be HTTP 200):"
-curl -sS -H "Token: ${API_KEY}" -w "\nHTTP:%{http_code}\n" \
-  "http://${BRIDGE_LISTEN_IP}:${BRIDGE_PORT}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=vless" | head -c 600; echo
+ok "Listen check (node port):"
+ss -lntp | grep -E ":${NODE_PORT}|xrayr" || true
 
-curl -sS -H "Token: ${API_KEY}" -w "\nHTTP:%{http_code}\n" \
-  "http://${BRIDGE_LISTEN_IP}:${BRIDGE_PORT}/api/v1/server/UniProxy/user?node_id=${NODE_ID}&node_type=vless" | head -c 600; echo
+# ========= 12) API 自检 =========
+ok "Panel API quick check (via bridge):"
+HOST="http://127.0.0.1:7002"
+curl -sS -H "Token: ${API_KEY}" \
+  "${HOST}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=vless" | head -c 500; echo
+curl -sS -H "Token: ${API_KEY}" \
+  "${HOST}/api/v1/server/UniProxy/user?node_id=${NODE_ID}&node_type=vless" | head -c 500; echo
 
-echo "[+] Done."
-echo "    Logs:"
-echo "      tail -n 200 /var/log/XrayR/runner.log"
-echo "      journalctl -u xrayr -n 200 --no-pager"
+echo
+echo "[+] DONE."
+echo "    - Logs: $LOG and /var/log/XrayR/runner.log"
+echo "    - Config: /etc/XrayR/config.yml"
+echo "    - Token bridge: 127.0.0.1:7002 -> 127.0.0.1:7001"
