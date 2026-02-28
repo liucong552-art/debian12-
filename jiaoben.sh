@@ -1,86 +1,178 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$' \n\t'
 
-# ====== 可改参数（也可运行时提示输入）======
-PANEL_UPSTREAM_DEFAULT="127.0.0.1:7001"
-LISTEN_PORT_DEFAULT="7002"
-ALLOW_NODE_IP_DEFAULT="14.137.255.86"
+trap 'echo "[x] Error at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-need_root() { [ "$(id -u)" -eq 0 ] || { echo "[x] 请用 root 运行"; exit 1; }; }
-tcp_check() {
-  local host="$1" port="$2"
-  timeout 1 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
-}
+log(){ echo "[+] $*"; }
+die(){ echo "[x] $*" >&2; exit 1; }
 
-need_root
+[ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo -i"
 
-echo "== 面板机 token-bridge 安装 =="
-read -rp "上游 xboard 地址 (默认 ${PANEL_UPSTREAM_DEFAULT}) : " PANEL_UPSTREAM || true
-PANEL_UPSTREAM="${PANEL_UPSTREAM:-$PANEL_UPSTREAM_DEFAULT}"
+# ===== 交互输入（默认按你的两机方案）=====
+read -rp "ApiHost (默认 http://104.224.158.191:7002): " APIHOST
+APIHOST="${APIHOST:-http://104.224.158.191:7002}"
 
-read -rp "token-bridge 监听端口 (默认 ${LISTEN_PORT_DEFAULT}) : " LISTEN_PORT || true
-LISTEN_PORT="${LISTEN_PORT:-$LISTEN_PORT_DEFAULT}"
+read -rsp "ApiKey(不回显): " APIKEY; echo
+[ -n "${APIKEY}" ] || die "ApiKey 不能为空"
 
-read -rp "允许访问的节点机 IP (默认 ${ALLOW_NODE_IP_DEFAULT}) : " ALLOW_NODE_IP || true
-ALLOW_NODE_IP="${ALLOW_NODE_IP:-$ALLOW_NODE_IP_DEFAULT}"
+read -rp "NodeID(例如 1): " NODEID
+[ -n "${NODEID}" ] || die "NodeID 不能为空"
 
-UP_HOST="${PANEL_UPSTREAM%:*}"
-UP_PORT="${PANEL_UPSTREAM#*:}"
+NODETYPE="Vless"
+PORT="8443"
 
-echo "[+] 检查上游是否监听：${UP_HOST}:${UP_PORT}"
-if ! tcp_check "$UP_HOST" "$UP_PORT"; then
-  echo "[x] 检测不到 ${UP_HOST}:${UP_PORT}（xboard 未监听/未映射）。请先保证 xboard 在本机可通过该地址访问。"
-  exit 1
+log "安装依赖..."
+apt-get update -y
+apt-get install -y git curl ca-certificates jq iproute2 build-essential unzip cron util-linux
+
+# ===== 自检：节点机必须能从面板机 7002 拉到 config/user =====
+log "自检面板接口（必须 200 且 users 非空）..."
+code1="$(curl -sS -o /tmp/cfg.json -w "%{http_code}" -H "Token: ${APIKEY}" \
+  "${APIHOST}/api/v1/server/UniProxy/config?node_id=${NODEID}&node_type=vless")" || true
+[ "$code1" = "200" ] || { cat /tmp/cfg.json 2>/dev/null || true; die "config 接口不是 200（得到 $code1）"; }
+
+code2="$(curl -sS -o /tmp/usr.json -w "%{http_code}" -H "Token: ${APIKEY}" \
+  "${APIHOST}/api/v1/server/UniProxy/user?node_id=${NODEID}&node_type=vless")" || true
+[ "$code2" = "200" ] || { cat /tmp/usr.json 2>/dev/null || true; die "user 接口不是 200（得到 $code2）"; }
+
+ul="$(jq -r '.users|length' /tmp/usr.json 2>/dev/null || echo 0)"
+[ "${ul}" != "0" ] || die "user 接口返回 users=0（面板还没把用户路由到该节点/或没订阅）"
+
+log "OK：config/user 都正常（users_len=${ul}）"
+
+# ===== 安装 Go（按我们成功经验：Go 1.25.3）=====
+if ! command -v go >/dev/null 2>&1; then
+  log "安装 Go 1.25.3..."
+  curl -fsSL -o /tmp/go1.25.3.linux-amd64.tar.gz https://go.dev/dl/go1.25.3.linux-amd64.tar.gz
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf /tmp/go1.25.3.linux-amd64.tar.gz
+fi
+export PATH=/usr/local/go/bin:$PATH
+go version || die "go 不可用"
+
+# ===== 拉取 XrayR（按我们成功经验：checkout dd786ef）=====
+log "拉取 XrayR 并 checkout dd786ef..."
+mkdir -p /usr/local/src
+if [ ! -d /usr/local/src/XrayR/.git ]; then
+  git clone https://github.com/XrayR-project/XrayR.git /usr/local/src/XrayR
+fi
+cd /usr/local/src/XrayR
+git fetch --all -p
+git checkout -f dd786ef
+
+# ===== 补丁 1：panel 不 panic（完全按我们之前做法）=====
+log "打补丁：panel 不 panic..."
+perl -pi -e 's/log\.Panicf\("Panel Start failed: %s", err\)/log.Errorf("Panel Start warning: %s", err)/g' panel/panel.go
+
+# ===== 补丁 2：users is null 不致命（返回 *[]api.UserInfo 空指针，避免你那次编译报错）=====
+# ✅ 一模一样的修复：return &[]api.UserInfo{}, nil
+log "打补丁：users is null 不致命..."
+if grep -q 'return nil, errors.New("users is null")' api/newV2board/v2board.go; then
+  sed -i 's/return nil, errors.New("users is null")/return \&[]api.UserInfo{}, nil/' api/newV2board/v2board.go
 fi
 
-echo "[+] 安装 nginx..."
-apt-get update -y
-apt-get install -y nginx curl ca-certificates
+# ===== 编译安装 =====
+log "编译安装 xrayr（第一次拉 Go 依赖会久）..."
+go build -o XrayR -ldflags "-s -w" .
+install -m 755 XrayR /usr/local/bin/xrayr
 
-# 删除默认站点，避免 nginx 试图占用 80
-rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default || true
+# ===== 写入 runner（同一套路）=====
+log "写入 runner..."
+cat >/usr/local/bin/xrayr-runner <<'RUN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LOG=/var/log/XrayR/runner.log
+mkdir -p /var/log/XrayR
+while true; do
+  echo "[runner] start $(date --iso-8601=seconds)" >>"$LOG"
+  /usr/local/bin/xrayr --config /etc/XrayR/config.yml >>"$LOG" 2>&1 || true
+  echo "[runner] xrayr exited at $(date --iso-8601=seconds), retry in 3s" >>"$LOG"
+  sleep 3
+done
+RUN
+chmod +x /usr/local/bin/xrayr-runner
 
-echo "[+] 写入 /etc/nginx/conf.d/xboard_token_bridge.conf"
-cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<NG
-server {
-  listen 0.0.0.0:${LISTEN_PORT};
-  listen [::]:${LISTEN_PORT};
-  server_name _;
+# ===== 写入 config.yml（同一套路 + 避坑项 CertConfig/REALITYConfigs）=====
+log "生成 /etc/XrayR/config.yml ..."
+mkdir -p /etc/XrayR /var/log/XrayR
+cat >/etc/XrayR/dns.json <<'J'
+{}
+J
+cat >/etc/XrayR/route.json <<'J'
+{}
+J
+cat >/etc/XrayR/custom_inbound.json <<'J'
+{}
+J
+cat >/etc/XrayR/custom_outbound.json <<'J'
+{}
+J
 
-  # 只允许节点机 + 本机自检（更安全：你也可以删掉 allow 127.0.0.1）
-  allow ${ALLOW_NODE_IP};
-  allow 127.0.0.1;
-  deny all;
+cat >/etc/XrayR/config.yml <<EOF
+Log:
+  Level: info
+  AccessPath: /var/log/XrayR/access.log
+  ErrorPath: /var/log/XrayR/error.log
 
-  location / {
-    # token 优先 query，其次 Token header
-    set \$token \$arg_token;
-    if (\$token = "") { set \$token \$http_token; }
-    if (\$token = "") { return 400; }
+DnsConfigPath: /etc/XrayR/dns.json
+RouteConfigPath: /etc/XrayR/route.json
+InboundConfigPath: /etc/XrayR/custom_inbound.json
+OutboundConfigPath: /etc/XrayR/custom_outbound.json
 
-    set \$sep "";
-    if (\$args != "") { set \$sep "&"; }
+Nodes:
+  - PanelType: "NewV2board"
+    ApiHost: "${APIHOST}"
+    ApiKey: "${APIKEY}"
+    NodeID: ${NODEID}
+    NodeType: ${NODETYPE}
+    Timeout: 30
+    EnableVless: true
+    EnableXTLS: true
+    VlessFlow: "xtls-rprx-vision"
 
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_set_header Host 127.0.0.1;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    # ✅ 避坑：nil panic
+    CertConfig:
+      CertMode: none
+    REALITYConfigs:
+      Show: false
 
-    # 关键：把 token 拼到 query 再转发到上游
-    proxy_pass http://${PANEL_UPSTREAM}\$uri?\$args\$sep"token="\$token;
-  }
-}
-NG
+    ControllerConfig:
+      ListenIP: "0.0.0.0"
+      SendIP: "0.0.0.0"
+      UpdatePeriodic: 60
+EOF
+chmod 600 /etc/XrayR/config.yml
 
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
+# ===== systemd（同一套路）=====
+log "写入 systemd..."
+cat >/etc/systemd/system/xrayr.service <<'EOF'
+[Unit]
+Description=XrayR Service (stable runner)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
-echo
-echo "[+] DONE：面板机 token-bridge 已启用"
-echo "面板机请放行端口 ${LISTEN_PORT}（只放行 ${ALLOW_NODE_IP} 更安全）"
-echo
-echo "自检（注意 header 写法必须是 Token:xxx）："
-echo "  curl -sS -H 'Token: <ApiKey>' 'http://127.0.0.1:${LISTEN_PORT}/api/v1/server/UniProxy/config?node_id=1&node_type=vless' | jq ."
-echo "  curl -sS -H 'Token: <ApiKey>' 'http://127.0.0.1:${LISTEN_PORT}/api/v1/server/UniProxy/user?node_id=1&node_type=vless' | jq ."
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xrayr-runner
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now xrayr
+
+# ===== 提示放行端口 =====
+log "提示：请确保节点机放行 TCP ${PORT}（给客户端连）"
+log "验收："
+ss -lntp | grep -E ":${PORT}|xrayr" || true
+tail -n 120 /var/log/XrayR/runner.log || true
+
+log "DONE"
+echo "日志：journalctl -u xrayr -o cat -n 200"
+echo "runner：tail -n 200 /var/log/XrayR/runner.log"
