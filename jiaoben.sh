@@ -1,54 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log(){ echo -e "\033[1;32m[+]\033[0m $*"; }
-die(){ echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
+# ====== 可改参数（也可运行时提示输入）======
+PANEL_UPSTREAM_DEFAULT="127.0.0.1:7001"
+LISTEN_PORT_DEFAULT="7002"
+ALLOW_NODE_IP_DEFAULT="14.137.255.86"
 
-[ "$(id -u)" -eq 0 ] || die "请用 root 运行"
-export DEBIAN_FRONTEND=noninteractive
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "[x] 请用 root 运行"; exit 1; }; }
+tcp_check() {
+  local host="$1" port="$2"
+  timeout 1 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
 
-# 固定你的节点IP：只允许它访问 7002
-ALLOW_IP="14.137.255.86"
-XBOARD_UPSTREAM="http://127.0.0.1:7001"
+need_root
 
-# 1) 确认 xboard 在本机 7001
-if ! ss -lntp | grep -qE '127\.0\.0\.1:7001|:7001'; then
-  die "检测不到本机 127.0.0.1:7001（xboard 未监听）。请先确保面板容器/服务把 7001 监听在本机。"
+echo "== 面板机 token-bridge 安装 =="
+read -rp "上游 xboard 地址 (默认 ${PANEL_UPSTREAM_DEFAULT}) : " PANEL_UPSTREAM || true
+PANEL_UPSTREAM="${PANEL_UPSTREAM:-$PANEL_UPSTREAM_DEFAULT}"
+
+read -rp "token-bridge 监听端口 (默认 ${LISTEN_PORT_DEFAULT}) : " LISTEN_PORT || true
+LISTEN_PORT="${LISTEN_PORT:-$LISTEN_PORT_DEFAULT}"
+
+read -rp "允许访问的节点机 IP (默认 ${ALLOW_NODE_IP_DEFAULT}) : " ALLOW_NODE_IP || true
+ALLOW_NODE_IP="${ALLOW_NODE_IP:-$ALLOW_NODE_IP_DEFAULT}"
+
+UP_HOST="${PANEL_UPSTREAM%:*}"
+UP_PORT="${PANEL_UPSTREAM#*:}"
+
+echo "[+] 检查上游是否监听：${UP_HOST}:${UP_PORT}"
+if ! tcp_check "$UP_HOST" "$UP_PORT"; then
+  echo "[x] 检测不到 ${UP_HOST}:${UP_PORT}（xboard 未监听/未映射）。请先保证 xboard 在本机可通过该地址访问。"
+  exit 1
 fi
 
-log "安装 nginx..."
+echo "[+] 安装 nginx..."
 apt-get update -y
-apt-get install -y nginx
+apt-get install -y nginx curl ca-certificates
 
-# 2) 删除默认站点（避免 listen 80 冲突）
+# 删除默认站点，避免 nginx 试图占用 80
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default || true
 
-# 3) 写 token-bridge：0.0.0.0:7002 -> 127.0.0.1:7001
+echo "[+] 写入 /etc/nginx/conf.d/xboard_token_bridge.conf"
 cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<NG
 server {
-  listen 0.0.0.0:7002;
+  listen 0.0.0.0:${LISTEN_PORT};
+  listen [::]:${LISTEN_PORT};
   server_name _;
 
-  location / {
-    # 只允许节点机访问
-    allow ${ALLOW_IP};
-    deny all;
+  # 只允许节点机 + 本机自检（更安全：你也可以删掉 allow 127.0.0.1）
+  allow ${ALLOW_NODE_IP};
+  allow 127.0.0.1;
+  deny all;
 
-    # token：优先 query token，其次 Header Token
+  location / {
+    # token 优先 query，其次 Token header
     set \$token \$arg_token;
     if (\$token = "") { set \$token \$http_token; }
     if (\$token = "") { return 400; }
 
-    # 如果原请求没带 token=，就把 header Token 注入到 query 里
-    if (\$arg_token = "") { set \$args "\${args}&token=\${token}"; }
-    # 如果原来没有任何 args，会变成 "&token=xxx"，把开头的 & 去掉
-    if (\$args ~ "^&")    { set \$args "token=\${token}"; }
+    set \$sep "";
+    if (\$args != "") { set \$sep "&"; }
 
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_set_header Host 127.0.0.1;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 
-    proxy_pass ${XBOARD_UPSTREAM}\$uri?\$args;
+    # 关键：把 token 拼到 query 再转发到上游
+    proxy_pass http://${PANEL_UPSTREAM}\$uri?\$args\$sep"token="\$token;
   }
 }
 NG
@@ -57,10 +77,10 @@ nginx -t
 systemctl enable --now nginx
 systemctl restart nginx
 
-ss -lntp | grep ':7002' >/dev/null || die "7002 未监听，nginx 启动失败"
-
-log "DONE：面板机 token-bridge 已启用"
-echo "面板机请放行端口 7002（只放行 ${ALLOW_IP} 更安全）"
-echo "自检（在面板机本机跑，Token 用你的 ApiKey）："
-echo "  curl -sS -H 'Token: ***' 'http://127.0.0.1:7002/api/v1/server/UniProxy/config?node_id=1&node_type=vless' | jq ."
-echo "  curl -sS -H 'Token: ***' 'http://127.0.0.1:7002/api/v1/server/UniProxy/user?node_id=1&node_type=vless' | jq ."
+echo
+echo "[+] DONE：面板机 token-bridge 已启用"
+echo "面板机请放行端口 ${LISTEN_PORT}（只放行 ${ALLOW_NODE_IP} 更安全）"
+echo
+echo "自检（注意 header 写法必须是 Token:xxx）："
+echo "  curl -sS -H 'Token: <ApiKey>' 'http://127.0.0.1:${LISTEN_PORT}/api/v1/server/UniProxy/config?node_id=1&node_type=vless' | jq ."
+echo "  curl -sS -H 'Token: <ApiKey>' 'http://127.0.0.1:${LISTEN_PORT}/api/v1/server/UniProxy/user?node_id=1&node_type=vless' | jq ."
