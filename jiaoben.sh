@@ -1,83 +1,37 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# =========================
-# jiaoben.sh  (XrayR + Xboard(NewV2board) VLESS/Reality/Vision 一键稳定版)
-# - 复原成功经验 + 避坑版
-# - 默认 checkout 稳定 tag v25.3.6（dd786ef 远端已不存在会导致失败）
-# - 精准修复：users is null -> 返回空列表指针（不再 panic/不再编译炸）
-# - 配置兜底：CertConfig/REALITYConfigs 防 nil panic
-# - Go 下载“像卡死”：设置 GOPROXY + 心跳输出 + 全程写日志
-# =========================
+log(){ echo -e "\n[+] $*\n"; }
+warn(){ echo -e "\n[!] $*\n" >&2; }
+die(){ echo -e "\n[x] $*\n" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1; }
 
-# ---- CRLF 自愈（Windows 记事本保存常见）----
-if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
-  sed -i 's/\r$//' "${BASH_SOURCE[0]}" || true
-  exec bash "${BASH_SOURCE[0]}" "$@"
-fi
+require_root(){ [ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo -i"; }
 
-LOG_FILE="/var/log/xrayr_onekey.log"
-mkdir -p /var/log
-touch "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-trap 'echo -e "\n[!] ERROR line=$LINENO cmd=$BASH_COMMAND\n    -> log: $LOG_FILE\n" >&2' ERR
-
-log(){ echo -e "\n[*] $*\n"; }
-die(){ echo -e "\n[!] $*\n" >&2; exit 1; }
-
-require_root(){
-  [[ "$(id -u)" == "0" ]] || die "请用 root 运行（sudo -i）"
-}
-
-need_cmd(){
-  command -v "$1" >/dev/null 2>&1
-}
-
-apt_install(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y "$@"
-}
-
-read_input(){
-  local var="$1" prompt="$2" def="${3:-}"
-  local val=""
-  if [[ -n "${!var:-}" ]]; then return; fi
-  if [[ -n "$def" ]]; then
-    read -r -p "$prompt [$def]: " val || true
-    val="${val:-$def}"
+os_install_pkgs(){
+  log "安装依赖..."
+  if need apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y \
+      git curl ca-certificates jq unzip tar \
+      build-essential pkg-config \
+      iproute2 iptables \
+      perl
+  elif need dnf; then
+    dnf install -y \
+      git curl ca-certificates jq unzip tar \
+      gcc gcc-c++ make pkgconf-pkg-config \
+      iproute iptables \
+      perl
+  elif need yum; then
+    yum install -y \
+      git curl ca-certificates jq unzip tar \
+      gcc gcc-c++ make pkgconfig \
+      iproute iptables \
+      perl
   else
-    read -r -p "$prompt: " val || true
-  fi
-  [[ -n "$val" ]] || die "输入不能为空：$var"
-  printf -v "$var" '%s' "$val"
-}
-
-read_secret(){
-  local var="$1" prompt="$2"
-  if [[ -n "${!var:-}" ]]; then return; fi
-  local val=""
-  read -r -s -p "$prompt: " val || true
-  echo
-  [[ -n "$val" ]] || die "输入不能为空：$var"
-  printf -v "$var" '%s' "$val"
-}
-
-pick_go_version_from_gomod(){
-  local gomod="$1"
-  local toolchain go_line
-  toolchain="$(awk '$1=="toolchain"{print $2}' "$gomod" 2>/dev/null | head -n1 || true)"
-  if [[ -n "$toolchain" ]]; then
-    echo "${toolchain#go}"
-    return
-  fi
-  go_line="$(awk '$1=="go"{print $2}' "$gomod" 2>/dev/null | head -n1 || true)"
-  [[ -n "$go_line" ]] || die "无法从 go.mod 解析 Go 版本"
-  if [[ "$go_line" =~ ^[0-9]+\.[0-9]+$ ]]; then
-    echo "${go_line}.0"
-  else
-    echo "$go_line"
+    die "不支持的发行版：找不到 apt-get / dnf / yum"
   fi
 }
 
@@ -89,9 +43,30 @@ go_arch(){
   esac
 }
 
+pick_go_version_from_gomod(){
+  local gomod="$1"
+  local toolchain go_line
+
+  toolchain="$(awk '$1=="toolchain"{print $2}' "$gomod" 2>/dev/null | head -n1 || true)"
+  if [[ -n "${toolchain}" ]]; then
+    echo "${toolchain#go}"
+    return
+  fi
+
+  go_line="$(awk '$1=="go"{print $2}' "$gomod" 2>/dev/null | head -n1 || true)"
+  [[ -n "${go_line}" ]] || die "无法从 go.mod 解析 Go 版本"
+
+  if [[ "${go_line}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "${go_line}.0"
+  else
+    echo "${go_line}"
+  fi
+}
+
 install_go(){
   local ver="$1"
   local arch tgz url
+
   arch="$(go_arch)"
   tgz="go${ver}.linux-${arch}.tar.gz"
   url="https://go.dev/dl/${tgz}"
@@ -101,7 +76,7 @@ install_go(){
   else
     log "安装 Go ${ver}（${arch}）..."
     rm -rf /usr/local/go
-    curl -fsSL "$url" -o "/tmp/${tgz}"
+    curl -fsSL "${url}" -o "/tmp/${tgz}"
     tar -C /usr/local -xzf "/tmp/${tgz}"
   fi
 
@@ -109,126 +84,104 @@ install_go(){
   cat >/etc/profile.d/go.sh <<'EOF'
 export PATH=/usr/local/go/bin:$PATH
 EOF
-
   export PATH=/usr/local/go/bin:$PATH
-  command -v go >/dev/null || die "Go 安装失败：找不到 go"
-  command -v gofmt >/dev/null || die "Go 安装异常：找不到 gofmt"
   go version
 }
 
-setup_go_proxy(){
-  # 为了避免“go downloading 卡住”，直接给一个强韧组合：
-  # - 先走 goproxy.cn（国内常用），不通则走官方 proxy.golang.org
-  # - 关闭 sumdb 避免某些网络下校验卡死
-  export GOPROXY="${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}"
-  export GOSUMDB="${GOSUMDB:-off}"
-  export GOFLAGS="${GOFLAGS:--buildvcs=false}"
-
-  # 写入 go env（可选）
-  go env -w GOPROXY="$GOPROXY" >/dev/null 2>&1 || true
-  go env -w GOSUMDB="$GOSUMDB" >/dev/null 2>&1 || true
-  go env -w GOFLAGS="$GOFLAGS" >/dev/null 2>&1 || true
-
-  log "Go env: GOPROXY=$GOPROXY  GOSUMDB=$GOSUMDB  GOFLAGS=$GOFLAGS"
+pick_port(){
+  local p
+  for p in 8443 2053 2083 2096 9443 30443; do
+    if ! ss -lntp 2>/dev/null | grep -qE ":${p}\b"; then
+      echo "$p"; return
+    fi
+  done
+  die "找不到可用端口（8443/2053/2083/2096/9443/30443 都被占用）"
 }
 
-run_with_heartbeat(){
-  # 让“看起来没输出”的阶段持续打印心跳，避免你以为卡死
-  local title="$1"; shift
-  log "$title"
-  ( while true; do echo "[hb] $(date '+%F %T') $title"; sleep 8; done ) &
-  local hb_pid=$!
-  set +e
-  "$@"
-  local rc=$?
-  set -e
-  kill "$hb_pid" >/dev/null 2>&1 || true
-  wait "$hb_pid" >/dev/null 2>&1 || true
-  return $rc
+backup_if_exists(){
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%F_%H%M%S)" || true
+  fi
 }
 
-git_checkout_stable(){
-  local repo="$1"
-  local tag="$2"
-  local dir="/usr/local/src/XrayR"
+stop_old(){
+  systemctl stop xrayr 2>/dev/null || true
+  systemctl disable xrayr 2>/dev/null || true
+  systemctl reset-failed xrayr 2>/dev/null || true
+}
 
-  mkdir -p /usr/local/src
+clone_or_update_repo(){
+  local dir="$1"
+  local repo="${2:-https://github.com/XrayR-project/XrayR}"
+  mkdir -p "$(dirname "$dir")"
+
   if [[ -d "$dir/.git" ]]; then
-    log "更新 XrayR 仓库..."
-    git -C "$dir" fetch --all --tags -q
+    log "更新 XrayR 源码..."
+    cd "$dir"
+    git fetch --all --tags -q
+    git reset --hard origin/master -q
   else
-    log "克隆 XrayR 仓库..."
+    log "克隆 XrayR 源码..."
     rm -rf "$dir"
     git clone "$repo" "$dir"
-    git -C "$dir" fetch --all --tags -q
-  fi
-
-  cd "$dir"
-  if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-    log "checkout tag: $tag"
-    git checkout -f "$tag"
-  else
-    local latest
-    latest="$(git tag --sort=-v:refname | head -n1 || true)"
-    [[ -n "$latest" ]] || die "仓库里没有 tag？请检查：$repo"
-    log "tag $tag 不存在，自动改用最新 tag: $latest"
-    git checkout -f "$latest"
+    cd "$dir"
+    git fetch --all --tags -q
+    git reset --hard origin/master -q
   fi
 }
 
-patch_users_is_null(){
-  local f="api/newV2board/v2board.go"
-  [[ -f "$f" ]] || die "找不到文件：$f（仓库结构变了？）"
+apply_patches(){
+  log "应用稳定性补丁（幂等，可重复执行）..."
 
-  if grep -q 'return &empty, nil' "$f"; then
-    log "补丁已存在：users is null -> &empty, nil（跳过）"
-    return
+  # 1) inboundbuilder.go：CertConfig nil 兜底
+  if [[ -f service/controller/inboundbuilder.go ]] && grep -q 'config\.CertConfig\.CertMode != "none"' service/controller/inboundbuilder.go; then
+    sed -i 's/nodeInfo\.EnableTLS \&\& config\.CertConfig\.CertMode != "none"/nodeInfo.EnableTLS \&\& config.CertConfig != nil \&\& config.CertConfig.CertMode != "none"/g' \
+      service/controller/inboundbuilder.go
   fi
 
-  if ! grep -q 'errors.New("users is null")' "$f"; then
-    log "未发现 users is null 逻辑（可能上游已修复），跳过补丁"
-    return
+  # 2) inboundbuilder.go：REALITYConfigs nil 兜底
+  if [[ -f service/controller/inboundbuilder.go ]] && grep -q 'Show: config\.REALITYConfigs\.Show' service/controller/inboundbuilder.go; then
+    sed -i 's/Show: config\.REALITYConfigs\.Show,/Show: (config.REALITYConfigs != nil \&\& config.REALITYConfigs.Show),/g' \
+      service/controller/inboundbuilder.go
   fi
 
-  log "应用补丁：users is null -> 返回空切片指针（不报错）"
-  # 用 patch 精准改三行，避免误伤导致编译炸（你之前那种 353/444 return values 就是误伤）
-  patch -p0 -N "$f" <<'PATCH'
-*** api/newV2board/v2board.go
---- api/newV2board/v2board.go
-***************
-*** 1,1 ****
---- 1,1 ----
-PATCH
-  # 上面只是占位确保 patch 命令存在；实际用 perl 做“最小范围替换”（严格锚定 users is null 行）
+  # 3) NewV2board：users is null 不再致命
+  if [[ -f api/newV2board/v2board.go ]] && grep -q 'errors.New("users is null")' api/newV2board/v2board.go; then
+    perl -pi -e 's/return\s+nil,\s*errors\.New\("users is null"\)/return nil, nil/g' api/newV2board/v2board.go
+  fi
 
-  # 只替换： if len(users) == 0 { return nil, errors.New("users is null") }
-  # 为：      if len(users) == 0 { empty := make([]api.UserInfo,0); return &empty, nil }
-  perl -pi -e '
-    if ($.>=1) {
-      s/^\s*return\s+nil,\s*errors\.New\("users is null"\)\s*$/\t\tempty := make([]api.UserInfo, 0)\n\t\treturn \&empty, nil/;
-    }
-  ' "$f"
+  # 4) Panel Start：panic -> warning + continue
+  if [[ -f panel/panel.go ]]; then
+    perl -0777 -pi -e 's/log\.Panicf\("Panel Start failed: %s",\s*err\)/log.Errorf("Panel Start warning: %s", err); continue/g' panel/panel.go
+    perl -0777 -pi -e 's/logrus\.Panicf\("Panel Start failed: %s",\s*err\)/logrus.Errorf("Panel Start warning: %s", err); continue/g' panel/panel.go
+    perl -0777 -pi -e 's/logrus\.Panicf\("Panel Start failed:\s*/logrus.Errorf("Panel Start warning:/g' panel/panel.go
+  fi
 
-  # 额外保险：如果出现 “return []api.UserInfo{}” 这种错误返回，也替换掉
-  perl -pi -e '
-    if ($.>=1) {
-      s/^\s*return\s+\[\]api\.UserInfo\{\},\s*nil\s*$/\t\tempty := make([]api.UserInfo, 0)\n\t\treturn \&empty, nil/;
-    }
-  ' "$f"
-
-  gofmt -w "$f" || true
-
-  grep -n 'users is null' "$f" || true
-  grep -n 'return \&empty, nil' "$f" >/dev/null || die "补丁未生效：$f"
+  # 5) token 兼容（可选）：Header(Token) 后面补 Query(token)
+  #    如不想打这个补丁：运行前 export XR_DISABLE_TOKEN_QUERY_PATCH=1
+  if [[ "${XR_DISABLE_TOKEN_QUERY_PATCH:-0}" != "1" ]]; then
+    local files
+    files="$(grep -R --line-number 'SetHeader("Token"' panel api 2>/dev/null | cut -d: -f1 | sort -u || true)"
+    if [[ -n "${files}" ]]; then
+      perl -0777 -pi -e 's/\.SetHeader\("Token",\s*([^)]+?)\)(?!\s*\.SetQueryParam\("token")/.SetHeader("Token", $1).SetQueryParam("token", $1)/g' $files
+    fi
+  fi
 }
 
-write_xrayr_config(){
+build_and_install(){
+  log "编译安装 xrayr..."
+  export PATH=/usr/local/go/bin:$PATH
+  go env -w GO111MODULE=on >/dev/null 2>&1 || true
+  go build -o XrayR -ldflags "-s -w" .
+  install -m 755 XrayR /usr/local/bin/xrayr
+  /usr/local/bin/xrayr version || true
+}
+
+write_config(){
   local api_host="$1" api_key="$2" node_id="$3" update_periodic="$4"
 
   mkdir -p /etc/XrayR /var/log/XrayR
-  chmod 700 /etc/XrayR
-  touch /var/log/XrayR/runner.log /var/log/XrayR/access.log /var/log/XrayR/error.log
-
   cat >/etc/XrayR/config.yml <<EOF
 Log:
   Level: info
@@ -243,50 +196,83 @@ Nodes:
       NodeID: ${node_id}
       NodeType: Vless
       Timeout: 30
+
       EnableVless: true
       EnableXTLS: true
       VlessFlow: "xtls-rprx-vision"
-      # 兜底：避免 nil panic
-      CertConfig:
-        CertMode: none
-      REALITYConfigs:
-        Show: false
+
     ControllerConfig:
       ListenIP: 0.0.0.0
       SendIP: 0.0.0.0
       UpdatePeriodic: ${update_periodic}
-      DisableSniffing: true
-EOF
 
+      DisableLocalREALITYConfig: true
+
+      REALITYConfigs:
+        Show: false
+
+      CertConfig:
+        CertMode: none
+EOF
   chmod 600 /etc/XrayR/config.yml
 }
 
-install_runner_and_systemd(){
+write_runner(){
+  log "安装 xrayr-runner（自动重试，避免 systemd StartLimit 把服务打死）..."
   cat >/usr/local/bin/xrayr-runner <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-LOG="/var/log/XrayR/runner.log"
+
 CFG="/etc/XrayR/config.yml"
+LOG="/var/log/XrayR/runner.log"
 mkdir -p /var/log/XrayR
-touch "$LOG"
+
+API_HOST="$(awk -F'"' '/ApiHost:/{print $2; exit}' "$CFG")"
+API_KEY="$(awk -F'"' '/ApiKey:/{print $2; exit}' "$CFG")"
+NODE_ID="$(awk '/NodeID:/{print $2; exit}' "$CFG")"
+NODE_TYPE="$(awk '/NodeType:/{print $2; exit}' "$CFG")"
+NODE_TYPE_LC="$(echo "${NODE_TYPE}" | tr '[:upper:]' '[:lower:]')"
+
+health_check() {
+  local base="${API_HOST%/}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=${NODE_TYPE_LC}"
+
+  local code
+  code="$(curl -m 8 -sS -o /dev/null -w "%{http_code}" -H "Token: ${API_KEY}" "${base}" || echo "000")"
+  if [[ "${code}" == "200" ]]; then return 0; fi
+
+  code="$(curl -m 8 -sS -o /dev/null -w "%{http_code}" "${base}&token=${API_KEY}" || echo "000")"
+  [[ "${code}" == "200" ]]
+}
+
 while true; do
-  echo "[runner] start $(date --iso-8601=seconds)" >>"$LOG"
-  /usr/local/bin/xrayr -c "$CFG" >>"$LOG" 2>&1 || true
-  echo "[runner] xrayr exited at $(date --iso-8601=seconds), retry in 3s" >>"$LOG"
+  if ! health_check; then
+    echo "[runner] panel api not ready (HTTP!=200). sleep 3s" >>"${LOG}"
+    sleep 3
+    continue
+  fi
+
+  /usr/local/bin/xrayr --config "${CFG}" >>"${LOG}" 2>&1 || true
+  echo "[runner] xrayr exited at $(date -Is), retry in 3s" >>"${LOG}"
   sleep 3
 done
 EOF
   chmod +x /usr/local/bin/xrayr-runner
+}
 
+write_systemd(){
+  log "写入 systemd service..."
   cat >/etc/systemd/system/xrayr.service <<'EOF'
 [Unit]
 Description=XrayR Service (stable runner)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
+User=root
+WorkingDirectory=/etc/XrayR
 ExecStart=/usr/local/bin/xrayr-runner
 Restart=always
 RestartSec=2
@@ -300,91 +286,96 @@ EOF
   systemctl enable --now xrayr
 }
 
-setup_xboard_cron_if_present(){
-  # 只有在本机确实有 xboard-web-1 容器时才装
-  if need_cmd docker && docker ps --format '{{.Names}}' | grep -q '^xboard-web-1$'; then
-    log "检测到 xboard-web-1：配置 cron 每分钟跑 schedule:run（用于封禁/超流量等计划任务）"
-    apt_install cron util-linux >/dev/null
-    cat >/etc/cron.d/xboard-schedule <<'EOF'
-* * * * * root flock -n /tmp/xboard_schedule.lock docker exec -i xboard-web-1 php artisan schedule:run --no-interaction >>/var/log/xboard_schedule.log 2>&1
-EOF
-    chmod 644 /etc/cron.d/xboard-schedule
-    touch /var/log/xboard_schedule.log
-    systemctl enable --now cron
-  else
-    log "未检测到 xboard-web-1（跳过 schedule cron）"
+open_firewall(){
+  local port="$1"
+  log "放行 ${port}/tcp..."
+  if need ufw; then ufw allow "${port}/tcp" 2>/dev/null || true; fi
+  if need firewall-cmd; then
+    firewall-cmd --permanent --add-port="${port}/tcp" 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
   fi
+  iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || true
+}
+
+post_check(){
+  log "服务状态："
+  systemctl status xrayr --no-pager -l || true
+
+  log "最近 120 行 journald："
+  journalctl -u xrayr -o cat -n 120 || true
+
+  log "runner.log（最近 120 行）："
+  tail -n 120 /var/log/XrayR/runner.log 2>/dev/null || true
 }
 
 main(){
   require_root
-  log "[+] Start: $(date) | log: $LOG_FILE"
+  os_install_pkgs
+  stop_old
 
-  if ! need_cmd apt-get; then
-    die "此脚本按 Debian/Ubuntu(apt-get) 写的，你的系统不匹配。"
+  # ---- 支持环境变量（方便你自动化），不提供则交互输入 ----
+  local API_HOST="${API_HOST:-}"
+  local API_KEY="${API_KEY:-}"
+  local NODE_ID="${NODE_ID:-}"
+  local UPD="${UPD:-}"
+
+  log "请输入面板信息（ApiKey 不回显；也可用环境变量 API_HOST/API_KEY/NODE_ID/UPD）"
+  if [[ -z "${API_HOST}" ]]; then
+    read -rp "ApiHost（例如 https://panel.example.com 或 http://127.0.0.1:7001）: " API_HOST
+  fi
+  if [[ -z "${API_KEY}" ]]; then
+    read -rsp "ApiKey（不回显）: " API_KEY; echo
+  fi
+  if [[ -z "${NODE_ID}" ]]; then
+    read -rp "NodeID（例如 1）: " NODE_ID
+  fi
+  if [[ -z "${UPD}" ]]; then
+    read -rp "UpdatePeriodic（建议 10~60，默认 10；不要填 5）: " UPD || true
   fi
 
-  log "Basic deps..."
-  apt_install ca-certificates curl jq perl iproute2 tar git patch >/dev/null
+  [[ "${API_HOST}" =~ ^https?:// ]] || die "ApiHost 必须以 http:// 或 https:// 开头"
+  [[ -n "${API_KEY}" ]] || die "ApiKey 不能为空"
+  [[ "${NODE_ID}" =~ ^[0-9]+$ ]] || die "NodeID 必须是数字"
 
-  # ---- 交互输入（也支持环境变量免交互）----
-  XRAYR_NODE_ID="${XRAYR_NODE_ID:-}"
-  XRAYR_API_KEY="${XRAYR_API_KEY:-}"
-  XRAYR_API_HOST="${XRAYR_API_HOST:-http://127.0.0.1:7001}"
-  XRAYR_UPDATE_PERIODIC="${XRAYR_UPDATE_PERIODIC:-60}"
-  XRAYR_REPO="${XRAYR_REPO:-https://github.com/XrayR-project/XrayR.git}"
-  XRAYR_TAG="${XRAYR_TAG:-v25.3.6}"
+  if [[ -z "${UPD:-}" ]]; then UPD="10"; fi
+  [[ "${UPD}" =~ ^[0-9]+$ ]] || die "UpdatePeriodic 必须是数字"
+  if (( UPD < 10 )) && [[ "${ALLOW_FAST_UPDATE:-0}" != "1" ]]; then
+    warn "UpdatePeriodic=${UPD} 太小（你之前踩过 5 秒会放大 users=null/崩溃概率），已自动改为 10。"
+    UPD="10"
+  fi
 
-  read_input XRAYR_NODE_ID "[?] Enter NodeID (e.g. 1)" "${XRAYR_NODE_ID:-1}"
-  read_secret XRAYR_API_KEY "[?] Enter ApiKey (input hidden)"
-  read_input XRAYR_API_HOST "[?] Enter ApiHost" "$XRAYR_API_HOST"
-  read_input XRAYR_UPDATE_PERIODIC "[?] Enter UpdatePeriodic(seconds)" "$XRAYR_UPDATE_PERIODIC"
-  read_input XRAYR_REPO "[?] Enter XrayR repo" "$XRAYR_REPO"
-  read_input XRAYR_TAG "[?] Enter XrayR tag" "$XRAYR_TAG"
+  local port
+  port="$(pick_port)"
 
-  log "NodeID=$XRAYR_NODE_ID  ApiKeyLen=${#XRAYR_API_KEY}  ApiHost=$XRAYR_API_HOST  UpdatePeriodic=$XRAYR_UPDATE_PERIODIC"
-  setup_xboard_cron_if_present
+  local xr_dir="/usr/local/src/XrayR"
+  local repo_url="${XR_REPO_URL:-https://github.com/XrayR-project/XrayR}"
 
-  # ---- 拉代码 + checkout 稳定 tag ----
-  git_checkout_stable "$XRAYR_REPO" "$XRAYR_TAG"
+  clone_or_update_repo "${xr_dir}" "${repo_url}"
 
-  # ---- 读 go.mod 决定 Go 版本 ----
   local go_ver
-  go_ver="$(pick_go_version_from_gomod go.mod)"
-  install_go "$go_ver"
-  setup_go_proxy
+  go_ver="$(pick_go_version_from_gomod "${xr_dir}/go.mod")"
+  install_go "${go_ver}"
 
-  # ---- 需要编译环境 ----
-  log "Installing build deps..."
-  apt_install build-essential >/dev/null
+  apply_patches
+  build_and_install
 
-  # ---- 精准补丁：users is null ----
-  patch_users_is_null
+  backup_if_exists /etc/XrayR/config.yml
+  write_config "${API_HOST}" "${API_KEY}" "${NODE_ID}" "${UPD}"
+  write_runner
+  write_systemd
+  open_firewall "${port}"
 
-  # ---- 下载模块 + 编译（带心跳，避免你以为卡死）----
-  export PATH=/usr/local/go/bin:$PATH
-  run_with_heartbeat "go mod download (可能依赖多，会持续输出心跳)" go mod download
-  run_with_heartbeat "go build -v (编译安装 xrayr)" go build -v -trimpath -ldflags "-s -w" -o XrayR .
-
-  install -m 755 XrayR /usr/local/bin/xrayr
-  /usr/local/bin/xrayr version || true
-
-  # ---- 写配置 + systemd ----
-  write_xrayr_config "$XRAYR_API_HOST" "$XRAYR_API_KEY" "$XRAYR_NODE_ID" "$XRAYR_UPDATE_PERIODIC"
-  install_runner_and_systemd
-
-  sleep 2
-  log "Service status:"
-  systemctl status xrayr --no-pager -l || true
-  log "Listening:"
-  ss -lntp | grep -E 'xrayr|:8443|:9443|:2053|:2083|:2096' || true
-
-  log "DONE ✅
-- 配置: /etc/XrayR/config.yml
-- runner日志: /var/log/XrayR/runner.log
-- 一键日志: $LOG_FILE
-- 查看实时日志：tail -f /var/log/XrayR/runner.log
-"
+  log "完成 ✅"
+  echo "------------------------------------------------------------"
+  echo "[重要] 请到面板把该节点的端口设置为：${port}"
+  echo "      （面板下发端口；本机只是放行并承载服务）"
+  echo
+  echo "[查看日志]"
+  echo "  journalctl -u xrayr -o cat -n 200"
+  echo "  tail -n 200 /var/log/XrayR/runner.log"
+  echo "------------------------------------------------------------"
+  post_check
+  ss -lntp 2>/dev/null | grep -E ":${port}\b|xrayr" || true
 }
 
 main "$@"
