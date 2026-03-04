@@ -1,13 +1,16 @@
-cat >/root/setup_nat_wg_exit_final.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-# NAT 机（出网机）侧：作为 WG 出口，接收来自 VPS wg-nat 的流量并 MASQUERADE 出网
-# 用法：
-#   bash /root/setup_nat_wg_exit_final.sh <VPS_IP> '<VPS_WG_PUBLIC_KEY>'
+# NAT 机（出网机）侧：作为 WG 出口，接收来自 VPS 的流量并 MASQUERADE 出网
 #
-# 可覆盖参数：
+# 用法：
+#   bash nat.sh <VPS_IP> '<VPS_WG_PUBLIC_KEY>'
+#
+# 示例：
+#   bash nat.sh 104.224.158.191 'kuZSbsKq0rjLNXsJ9EPBeORJUEEqbEuBwwFX27+aYT8='
+#
+# 可覆盖参数（环境变量）：
 WG_IF="${WG_IF:-wg-exit}"
 WG_PORT="${WG_PORT:-51820}"
 WG_ADDR="${WG_ADDR:-10.66.66.2/24}"
@@ -37,10 +40,12 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 echo "==> 安装依赖（wireguard-tools / iproute2 / iptables / curl）..."
 apt-get update -y >/dev/null
-apt-get install -y wireguard-tools iproute2 iptables curl >/dev/null
+apt-get install -y wireguard-tools iproute2 iptables curl ca-certificates >/dev/null
 
+# 确保目录存在（你之前报错就是这里缺了）
 install -d -m 700 /etc/wireguard
 
+# 自动探测外网网卡
 if [[ -z "$WAN_IF" ]]; then
   WAN_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}' || true)"
 fi
@@ -53,6 +58,9 @@ net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 EOF
 sysctl --system >/dev/null 2>&1 || true
+
+# 再确认 wg 命令存在（你之前 wg: command not found 就是没装上）
+command -v wg >/dev/null 2>&1 || fail "wg 命令不存在：请确认 wireguard-tools 安装成功"
 
 echo "==> 生成 NAT 机 WireGuard 密钥（${WG_IF}）..."
 umask 077
@@ -92,25 +100,24 @@ CFG
 chmod 600 "/etc/wireguard/${WG_IF}.conf"
 
 systemctl daemon-reload >/dev/null 2>&1 || true
+
+# 启动 wg-quick
 systemctl enable "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
 systemctl restart "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
 
 if ! systemctl is-active --quiet "wg-quick@${WG_IF}"; then
   echo "❌ wg-quick@${WG_IF} 启动失败，日志如下：" >&2
   systemctl --no-pager --full status "wg-quick@${WG_IF}" >&2 || true
-  journalctl -u "wg-quick@${WG_IF}" --no-pager -n 120 >&2 || true
+  journalctl -u "wg-quick@${WG_IF}" --no-pager -n 200 >&2 || true
   exit 1
 fi
 
 echo
 echo "✅ NAT 机 WG-EXIT 部署完成。"
 echo "外网网卡: ${WAN_IF}"
+echo "接口名: ${WG_IF}"
 echo "==================== NAT 机 WG 公钥 ===================="
 echo "${NAT_PUB}"
 echo "========================================================="
 echo
 echo "下一步：回到 VPS 执行：/usr/local/sbin/wg_nat_set_peer.sh '${NAT_PUB}'"
-EOF
-
-chmod +x /root/setup_nat_wg_exit_final.sh
-bash /root/setup_nat_wg_exit_final.sh <VPS_IP> '<VPS_WG_PUBLIC_KEY>'
