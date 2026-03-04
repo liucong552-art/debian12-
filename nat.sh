@@ -113,4 +113,4 @@ echo "下一步：回到 VPS 执行：/usr/local/sbin/wg_nat_set_peer.sh '${NAT_
 EOF
 
 chmod +x /root/setup_nat_wg_exit_final.sh
-bash /root/setup_nat_wg_exit_final.sh 104.224.158.191 'kuZSbsKq0rjLNXsJ9EPBeORJUEEqbEuBwwFX27+aYT8='
+bash /root/setup_nat_wg_exit_final.sh <VPS_IP> '<VPS_WG_PUBLIC_KEY>'
