@@ -1,32 +1,23 @@
 #!/usr/bin/env bash
-# Debian 12 一键部署脚本（HY2 / 普通 ACME / 自定义伪装目标版）
-# - 初始化系统 & 内核
-# - HY2 主节点：hy2.liucna.com + 普通 ACME + masquerade
-# - HY2 临时账号 + 审计 + GC（绝对时间 TTL，同一 443 端口）
-# - nftables UDP 双向配额（仅统计 VPS<->用户）
-# - 日志 logrotate：保留最近 2 天
-# - systemd journal：自动 vacuum 保留 2 天
+# Debian 12 一键部署脚本（HY2 折中优化版）
+# - 初始化系统 & 新内核
+# - 主 HY2 节点：hy2.liucna.com:443 + ACME + masquerade
+# - 临时 HY2 节点：独立高端口 + 自签证书 + pinSHA256 + TTL + GC
+# - nftables UDP 双向配额系统（仅统计 VPS<->用户）
+# - logrotate / journal vacuum
 #
-# 特点：
-# - 不用 Cloudflare API / DNS API
-# - 不依赖 Hysteria trafficStats API 做核心逻辑
-# - 默认不开 Salamander（只保留可选开关）
-# - 伪装目标 MASQ_URL 必填，不写死官方示例站点
+# 设计目标：
+# - 主 443 保持官方主线 / 高伪装
+# - 临时高端口保留独立配额能力
+# - 避免给每个临时端口重复申请 ACME 证书
 #
-# 运行前准备：
-# 1) Cloudflare 里 A 记录：
-#    hy2 -> 你的 VPS 公网 IPv4
-#    并保持 DNS only（灰云）
-# 2) 准备两个环境变量：
-#    export ACME_EMAIL='你的邮箱'
-#    export MASQ_URL='https://你自己选的伪装站点'
+# 使用前准备：
+# - Cloudflare / DNS 中：
+#   hy2.liucna.com -> 你的 VPS IPv4
+# - 若使用 Cloudflare，必须保持 DNS only（灰云）
 #
-# 可选环境变量：
-#    export ENABLE_SALAMANDER='0'   # 默认 0
-#    export SALAMANDER_PASSWORD='你的混淆密码'
-#
-# 然后执行：
-#    bash this_script.sh
+# 运行：
+#   bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/debian12-/main/hy2.sh)
 
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -34,8 +25,6 @@ trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
 UP_BASE="/usr/local/src/debian12-upstream"
 HY_DOMAIN="hy2.liucna.com"
 HY_LISTEN=":443"
-
-# ------------------ 公共函数 ------------------
 
 curl_fs() {
   curl -fsSL --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 "$@"
@@ -47,7 +36,7 @@ check_debian12() {
     exit 1
   fi
   local codename
-  codename=$(grep -E "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+  codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
   if [[ "$codename" != "bookworm" ]]; then
     echo "❌ 本脚本仅适用于 Debian 12 (bookworm)，当前: ${codename:-未知}"
     exit 1
@@ -56,7 +45,6 @@ check_debian12() {
 
 need_basic_tools() {
   export DEBIAN_FRONTEND=noninteractive
-
   apt-get update -o Acquire::Retries=3
   apt-get install -y --no-install-recommends \
     ca-certificates curl wget openssl python3 nftables iproute2 coreutils util-linux logrotate
@@ -70,15 +58,11 @@ need_basic_tools() {
 download_upstreams() {
   echo "⬇ 下载/更新 上游文件到 ${UP_BASE} ..."
   mkdir -p "$UP_BASE"
-
   curl_fs "https://get.hy2.sh/" -o "${UP_BASE}/get_hy2.sh"
   chmod +x "${UP_BASE}/get_hy2.sh"
-
   echo "✅ 上游已更新："
   ls -l "$UP_BASE"
 }
-
-# ------------------ 1. 系统更新 + 新内核 ------------------
 
 install_update_all() {
   echo "🧩 写入 /usr/local/bin/update-all ..."
@@ -143,15 +127,12 @@ echo
 echo "🖥 当前正在运行的内核：$(uname -r)"
 echo "⚠️ 重启后系统才会真正切换到新内核，请执行：reboot"
 EOF
-
   chmod +x /usr/local/bin/update-all
 }
 
-# ------------------ 2. HY2 主节点一键 ------------------
-
-install_hy2_script() {
-  echo "🧩 写入 /root/onekey_hy2_acme.sh ..."
-  cat >/root/onekey_hy2_acme.sh << 'EOF'
+install_hy2_main_script() {
+  echo "🧩 写入 /root/onekey_hy2_main_acme.sh ..."
+  cat >/root/onekey_hy2_main_acme.sh << 'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -159,18 +140,12 @@ umask 077
 
 UP_BASE="/usr/local/src/debian12-upstream"
 HY_BASE="/etc/hysteria"
-BASE_ENV="${HY_BASE}/base.env"
-ACCOUNTS_DB="${HY_BASE}/accounts.db"
-CFG_FILE="${HY_BASE}/config.yaml"
+CFG_FILE="${HY_BASE}/config-main.yaml"
 SERVICE_FILE="/etc/systemd/system/hy2.service"
+ENV_FILE="/etc/default/hy2-main"
 
-HY_DOMAIN="hy2.liucna.com"
-HY_LISTEN=":443"
-
-ACME_EMAIL="${ACME_EMAIL:-}"
-MASQ_URL="${MASQ_URL:-}"
-ENABLE_SALAMANDER="${ENABLE_SALAMANDER:-0}"
-SALAMANDER_PASSWORD="${SALAMANDER_PASSWORD:-}"
+HY_DOMAIN_DEFAULT="hy2.liucna.com"
+HY_LISTEN_DEFAULT=":443"
 
 check_debian12() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -192,13 +167,9 @@ install_hysteria_from_local_or_repo() {
     curl -fsSL "https://get.hy2.sh/" -o "$installer"
     chmod +x "$installer"
   fi
-
   echo "⚙ 安装 / 更新 Hysteria 2 ..."
   bash "$installer"
-
-  if ! command -v hysteria >/dev/null 2>&1; then
-    echo "❌ 未找到 hysteria 可执行文件"; exit 1
-  fi
+  command -v hysteria >/dev/null 2>&1 || { echo "❌ 未找到 hysteria 可执行文件"; exit 1; }
 }
 
 yaml_quote() {
@@ -209,27 +180,37 @@ print("'" + s.replace("'", "''") + "'")
 PY
 }
 
-db_get_field_by_id() { # ID FIELD_INDEX
-  local id="$1" idx="$2"
-  awk -F'|' -v id="$id" -v idx="$idx" '$1==id {print $idx; exit}' "$ACCOUNTS_DB" 2>/dev/null || true
-}
-
 check_debian12
 
-if [[ -z "$ACME_EMAIL" ]]; then
-  echo "❌ 缺少 ACME_EMAIL 环境变量"
-  echo "   示例：export ACME_EMAIL='you@example.com'"
+if [[ ! -f "$ENV_FILE" ]]; then
+  cat >"$ENV_FILE" <<E
+HY_DOMAIN=${HY_DOMAIN_DEFAULT}
+HY_LISTEN=${HY_LISTEN_DEFAULT}
+ACME_EMAIL=
+MASQ_URL=
+ENABLE_SALAMANDER=0
+SALAMANDER_PASSWORD=
+NODE_NAME=HY2-MAIN
+E
+  chmod 600 "$ENV_FILE"
+  echo "❌ 已创建 $ENV_FILE ，请先编辑后再重试。"
+  echo "   nano $ENV_FILE"
   exit 1
 fi
 
-if [[ -z "$MASQ_URL" ]]; then
-  echo "❌ 缺少 MASQ_URL 环境变量"
-  echo "   示例：export MASQ_URL='https://你自己选的伪装站点'"
-  exit 1
-fi
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+: "${HY_DOMAIN:?缺少 HY_DOMAIN}"
+: "${HY_LISTEN:?缺少 HY_LISTEN}"
+: "${ACME_EMAIL:?缺少 ACME_EMAIL}"
+: "${MASQ_URL:?缺少 MASQ_URL}"
+: "${NODE_NAME:=HY2-MAIN}"
+: "${ENABLE_SALAMANDER:=0}"
+: "${SALAMANDER_PASSWORD:=}"
 
 if [[ "$ENABLE_SALAMANDER" == "1" && -z "$SALAMANDER_PASSWORD" ]]; then
-  echo "❌ ENABLE_SALAMANDER=1 时必须同时提供 SALAMANDER_PASSWORD"
+  echo "❌ ENABLE_SALAMANDER=1 时必须设置 SALAMANDER_PASSWORD"
   exit 1
 fi
 
@@ -250,106 +231,24 @@ systemctl stop hysteria-server.service 2>/dev/null || true
 systemctl disable hysteria-server.service 2>/dev/null || true
 
 echo
-echo "=== 3. 写入基础目录 / 认证后端 ==="
+echo "=== 3. 准备目录和主账号 ==="
 mkdir -p "$HY_BASE"
 chmod 700 "$HY_BASE" 2>/dev/null || true
 
-cat >"$BASE_ENV" <<B
-HY_DOMAIN=$HY_DOMAIN
-HY_LISTEN=$HY_LISTEN
-ACME_EMAIL=$ACME_EMAIL
-MASQ_URL=$MASQ_URL
-ENABLE_SALAMANDER=$ENABLE_SALAMANDER
-SALAMANDER_PASSWORD=$SALAMANDER_PASSWORD
-B
-chmod 600 "$BASE_ENV"
-
-cat >/usr/local/sbin/hy2_auth_command.sh <<'AUTH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-DB="/etc/hysteria/accounts.db"
-
-ADDR="${1:-}"
-AUTH_STR="${2:-}"
-TX_HINT="${3:-0}"
-
-[[ -f "$DB" ]] || exit 1
-[[ -n "$AUTH_STR" ]] || exit 1
-
-NOW=$(date +%s)
-
-while IFS='|' read -r ID TOKEN EXPIRE_EPOCH NOTE TYPE; do
-  [[ -z "${ID:-}" ]] && continue
-  [[ "${ID:0:1}" == "#" ]] && continue
-
-  if [[ "$TOKEN" == "$AUTH_STR" ]]; then
-    if [[ "$EXPIRE_EPOCH" =~ ^[0-9]+$ ]]; then
-      if (( EXPIRE_EPOCH == 0 || EXPIRE_EPOCH > NOW )); then
-        printf '%s\n' "$ID"
-        exit 0
-      fi
-    fi
-    exit 1
-  fi
-done <"$DB"
-
-exit 1
-AUTH
-chmod 700 /usr/local/sbin/hy2_auth_command.sh
-
-cat >/usr/local/sbin/hy2_show_link.sh <<'SHOW'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-ID="${1:?need ID}"
-BASE="/etc/hysteria/base.env"
-DB="/etc/hysteria/accounts.db"
-
-env_get() {
-  local key="$1"
-  awk -F= -v k="$key" '$1==k {sub($1"=",""); print; exit}' "$BASE"
-}
-
-[[ -f "$BASE" && -f "$DB" ]] || { echo "❌ 缺少基础文件"; exit 1; }
-
-DOMAIN="$(env_get HY_DOMAIN)"
-ENABLE_SALAMANDER="$(env_get ENABLE_SALAMANDER)"
-SALAMANDER_PASSWORD="$(env_get SALAMANDER_PASSWORD)"
-
-TOKEN="$(awk -F'|' -v id="$ID" '$1==id {print $2; exit}' "$DB")"
-[[ -n "$TOKEN" ]] || { echo "❌ 未找到账号: $ID"; exit 1; }
-
-URL="hy2://${TOKEN}@${DOMAIN}:443/?sni=${DOMAIN}#${ID}"
-if [[ "$ENABLE_SALAMANDER" == "1" ]]; then
-  URL="hy2://${TOKEN}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${SALAMANDER_PASSWORD}#${ID}"
+if [[ ! -f "${HY_BASE}/main.token" ]]; then
+  openssl rand -hex 16 > "${HY_BASE}/main.token"
+  chmod 600 "${HY_BASE}/main.token"
 fi
+MAIN_TOKEN="$(tr -d '\r\n' < "${HY_BASE}/main.token")"
 
-echo "$URL"
-SHOW
-chmod 700 /usr/local/sbin/hy2_show_link.sh
-
-echo
-echo "=== 4. 初始化主账号（如不存在） ==="
-if [[ ! -f "$ACCOUNTS_DB" ]]; then
-  MAIN_TOKEN="$(openssl rand -hex 16)"
-  printf 'main|%s|0|main|main\n' "$MAIN_TOKEN" >"$ACCOUNTS_DB"
-  chmod 600 "$ACCOUNTS_DB"
-else
-  chmod 600 "$ACCOUNTS_DB"
-  if ! awk -F'|' '$1=="main" {found=1} END{exit found?0:1}' "$ACCOUNTS_DB"; then
-    MAIN_TOKEN="$(openssl rand -hex 16)"
-    printf 'main|%s|0|main|main\n' "$MAIN_TOKEN" >>"$ACCOUNTS_DB"
-  fi
-fi
-
-echo
-echo "=== 5. 写入配置文件 ==="
 DOMAIN_Q="$(yaml_quote "$HY_DOMAIN")"
 EMAIL_Q="$(yaml_quote "$ACME_EMAIL")"
 MASQ_Q="$(yaml_quote "$MASQ_URL")"
-SALAMANDER_Q="$(yaml_quote "$SALAMANDER_PASSWORD")"
+TOKEN_Q="$(yaml_quote "$MAIN_TOKEN")"
+SALAM_Q="$(yaml_quote "$SALAMANDER_PASSWORD")"
 
+echo
+echo "=== 4. 写入主配置 ==="
 if [[ -f "$CFG_FILE" ]]; then
   cp -a "$CFG_FILE" "${CFG_FILE}.bak.$(date +%F-%H%M%S)"
 fi
@@ -363,14 +262,14 @@ fi
   echo "  email: ${EMAIL_Q}"
   echo
   echo "auth:"
-  echo "  type: command"
-  echo "  command: /usr/local/sbin/hy2_auth_command.sh"
+  echo "  type: password"
+  echo "  password: ${TOKEN_Q}"
   echo
   if [[ "$ENABLE_SALAMANDER" == "1" ]]; then
     echo "obfs:"
     echo "  type: salamander"
     echo "  salamander:"
-    echo "    password: ${SALAMANDER_Q}"
+    echo "    password: ${SALAM_Q}"
     echo
   fi
   echo "masquerade:"
@@ -387,7 +286,7 @@ fi
 chmod 600 "$CFG_FILE"
 
 echo
-echo "=== 6. 写入 systemd 服务 ==="
+echo "=== 5. 写入 systemd 服务 ==="
 HY_BIN="$(command -v hysteria)"
 cat >"$SERVICE_FILE" <<SVC
 [Unit]
@@ -398,7 +297,7 @@ After=network.target
 Type=simple
 User=root
 Group=root
-ExecStart=$HY_BIN server -c $CFG_FILE
+ExecStart=${HY_BIN} server -c ${CFG_FILE}
 Restart=on-failure
 RestartSec=2
 
@@ -418,95 +317,152 @@ if ! systemctl is-active --quiet hy2.service; then
   exit 1
 fi
 
-MAIN_URL="$(/usr/local/sbin/hy2_show_link.sh main)"
-if base64 --help 2>/dev/null | grep -q -- "-w"; then
-  echo "$MAIN_URL" | base64 -w0 >/root/hy2_subscription_base64.txt
-else
-  echo "$MAIN_URL" | base64 | tr -d '\n' >/root/hy2_subscription_base64.txt
+URL="hy2://${MAIN_TOKEN}@${HY_DOMAIN}:443/?sni=${HY_DOMAIN}#${NODE_NAME}"
+if [[ "$ENABLE_SALAMANDER" == "1" ]]; then
+  URL="hy2://${MAIN_TOKEN}@${HY_DOMAIN}:443/?sni=${HY_DOMAIN}&obfs=salamander&obfs-password=${SALAMANDER_PASSWORD}#${NODE_NAME}"
 fi
-echo "$MAIN_URL" >/root/hy2_main_url.txt
 
-chmod 600 /root/hy2_subscription_base64.txt /root/hy2_main_url.txt 2>/dev/null || true
+if base64 --help 2>/dev/null | grep -q -- "-w"; then
+  echo "$URL" | base64 -w0 >/root/hy2_main_subscription_base64.txt
+else
+  echo "$URL" | base64 | tr -d '\n' >/root/hy2_main_subscription_base64.txt
+fi
+echo "$URL" >/root/hy2_main_url.txt
+chmod 600 /root/hy2_main_url.txt /root/hy2_main_subscription_base64.txt 2>/dev/null || true
 
 echo
 echo "================== 主节点信息 =================="
-echo "$MAIN_URL"
+echo "$URL"
 echo
 echo "Base64 订阅："
-cat /root/hy2_subscription_base64.txt
+cat /root/hy2_main_subscription_base64.txt
 echo
 echo "保存位置："
 echo "  /root/hy2_main_url.txt"
-echo "  /root/hy2_subscription_base64.txt"
-echo "✅ Hysteria 2 主节点安装完成"
+echo "  /root/hy2_main_subscription_base64.txt"
+echo "✅ HY2 主节点安装完成"
 EOF
-
-  chmod +x /root/onekey_hy2_acme.sh
+  chmod +x /root/onekey_hy2_main_acme.sh
 }
 
-# ------------------ 3. HY2 临时账号 + 审计 + GC ------------------
-
-install_hy2_temp_audit() {
-  echo "🧩 写入 /root/hy2_temp_user_all.sh 和相关脚本 ..."
-  cat >/root/hy2_temp_user_all.sh << 'EOF'
+install_hy2_temp_system() {
+  echo "🧩 写入 /root/hy2_temp_port_all.sh 和相关脚本 ..."
+  cat >/root/hy2_temp_port_all.sh << 'EOF'
 #!/usr/bin/env bash
-# HY2 临时账号 + 审计 + GC（同一 443 端口 / 绝对时间 TTL）
+# HY2 临时节点：独立高端口 + 自签证书 + pinSHA256 + GC
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
 umask 077
 
 HY_BASE="/etc/hysteria"
-BASE_ENV="${HY_BASE}/base.env"
-ACCOUNTS_DB="${HY_BASE}/accounts.db"
-LOG="/var/log/hy2-gc.log"
+TEMP_DIR="${HY_BASE}/temp"
+CERT_DIR="${TEMP_DIR}/certs"
+ENV_FILE="/etc/default/hy2-main"
 
-[[ -f "$BASE_ENV" && -f "$ACCOUNTS_DB" ]] || {
-  echo "❌ 未找到 ${BASE_ENV} 或 ${ACCOUNTS_DB}，请先执行：bash /root/onekey_hy2_acme.sh"
+[[ -f "$ENV_FILE" ]] || {
+  echo "❌ 缺少 $ENV_FILE，请先执行：bash /root/onekey_hy2_main_acme.sh"
   exit 1
 }
 
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${HY_DOMAIN:?缺少 HY_DOMAIN}"
+
+mkdir -p "$TEMP_DIR" "$CERT_DIR"
+
 ########################################
-# 0) 小工具
+# 0) 公共工具
 ########################################
-cat >/usr/local/sbin/hy2_env_get.sh << 'GET'
+cat >/usr/local/sbin/hy2_temp_env_get.sh << 'GET'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 KEY="${1:?need KEY}"
-awk -F= -v k="$KEY" '$1==k {sub($1"=",""); print; exit}' /etc/hysteria/base.env
+awk -F= -v k="$KEY" '$1==k {sub($1"=",""); print; exit}' /etc/default/hy2-main
 GET
-chmod +x /usr/local/sbin/hy2_env_get.sh
+chmod +x /usr/local/sbin/hy2_temp_env_get.sh
+
+cat >/usr/local/sbin/hy2_temp_gen_cert.sh << 'GEN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CERT_DIR="/etc/hysteria/temp/certs"
+CRT="${CERT_DIR}/server.crt"
+KEY="${CERT_DIR}/server.key"
+ENV_FILE="/etc/default/hy2-main"
+
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${HY_DOMAIN:?missing HY_DOMAIN}"
+
+mkdir -p "$CERT_DIR"
+
+if [[ ! -s "$CRT" || ! -s "$KEY" ]]; then
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$KEY" \
+    -out "$CRT" \
+    -days 3650 \
+    -subj "/CN=${HY_DOMAIN}" \
+    -addext "subjectAltName = DNS:${HY_DOMAIN}" >/dev/null 2>&1
+  chmod 600 "$CRT" "$KEY" 2>/dev/null || true
+fi
+
+openssl x509 -noout -fingerprint -sha256 -in "$CRT" | awk -F= '{print toupper($2)}'
+GEN
+chmod +x /usr/local/sbin/hy2_temp_gen_cert.sh
 
 ########################################
-# 1) 单账号清理
+# 1) 单节点清理脚本
 ########################################
 cat >/usr/local/sbin/hy2_cleanup_one.sh << 'CLEAN'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-ID="${1:?need ID}"
-[[ "$ID" != "main" ]] || { echo "❌ 禁止删除 main"; exit 1; }
+meta_get() { local file="$1" key="$2"; awk -F= -v k="$key" '$1==k {sub($1"=",""); print; exit}' "$file"; }
 
-LOCK="/run/hy2-accounts.lock"
-exec 9>"$LOCK"
-flock -w 15 9
+TAG="${1:?need TAG}"
+UNIT_NAME="${TAG}.service"
+TEMP_DIR="/etc/hysteria/temp"
+CFG="${TEMP_DIR}/${TAG}.yaml"
+META="${TEMP_DIR}/${TAG}.meta"
+LOG="/var/log/hy2-gc.log"
+FORCE="${FORCE:-0}"
 
-DB="/etc/hysteria/accounts.db"
-TMP="${DB}.tmp"
+LOCK="/run/hy2-temp.lock"
+if [[ "${HY2_LOCK_HELD:-0}" != "1" ]]; then
+  exec 9>"$LOCK"
+  flock -w 10 9 || { echo "[hy2_cleanup_one] lock busy, skip cleanup: ${TAG}"; exit 0; }
+fi
 
-[[ -f "$DB" ]] || { echo "❌ accounts.db 不存在"; exit 1; }
+if [[ "$FORCE" != "1" && -f "$META" ]]; then
+  EXPIRE_EPOCH="$(meta_get "$META" EXPIRE_EPOCH || true)"
+  if [[ -n "${EXPIRE_EPOCH:-}" && "$EXPIRE_EPOCH" =~ ^[0-9]+$ ]]; then
+    NOW=$(date +%s)
+    if (( EXPIRE_EPOCH > NOW )); then
+      echo "[hy2_cleanup_one] ${TAG} 未到期，跳过清理"
+      exit 0
+    fi
+  fi
+fi
 
-awk -F'|' -v id="$ID" 'BEGIN{OFS="|"} $1!=id {print $0}' "$DB" >"$TMP"
-mv "$TMP" "$DB"
-chmod 600 "$DB" 2>/dev/null || true
+ACTIVE_STATE="$(systemctl show -p ActiveState --value "${UNIT_NAME}" 2>/dev/null || echo "")"
+if [[ "${ACTIVE_STATE}" == "active" || "${ACTIVE_STATE}" == "activating" ]]; then
+  if ! timeout 8 systemctl stop "${UNIT_NAME}" >/dev/null 2>&1; then
+    systemctl kill "${UNIT_NAME}" >/dev/null 2>&1 || true
+  fi
+fi
 
-echo "$(date '+%F %T %Z') cleanup ${ID}" >> /var/log/hy2-gc.log 2>/dev/null || true
-echo "✅ 已清理账号: $ID"
+systemctl disable "${UNIT_NAME}" >/dev/null 2>&1 || true
+rm -f "$CFG" "$META" "/etc/systemd/system/${UNIT_NAME}" 2>/dev/null || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+echo "$(date '+%F %T %Z') cleanup ${TAG}" >> "$LOG" 2>/dev/null || true
+echo "✅ 已清理临时节点: ${TAG}"
 CLEAN
 chmod +x /usr/local/sbin/hy2_cleanup_one.sh
 
 ########################################
-# 2) 创建临时账号：D=秒 hy2_mktemp.sh
+# 2) 创建临时节点：D=秒 hy2_mktemp.sh
 ########################################
 cat >/usr/local/sbin/hy2_mktemp.sh << 'MK'
 #!/usr/bin/env bash
@@ -520,88 +476,250 @@ if ! [[ "$D" =~ ^[0-9]+$ ]] || (( D <= 0 )); then
   exit 1
 fi
 
-LOCK="/run/hy2-accounts.lock"
+LOCK="/run/hy2-temp.lock"
 exec 9>"$LOCK"
-flock -w 15 9
+flock -w 10 9
 
-DB="/etc/hysteria/accounts.db"
-SHOW_LINK="/usr/local/sbin/hy2_show_link.sh"
+ENV_FILE="/etc/default/hy2-main"
+TEMP_DIR="/etc/hysteria/temp"
+CERT_DIR="${TEMP_DIR}/certs"
+CRT="${CERT_DIR}/server.crt"
+KEY="${CERT_DIR}/server.key"
 
-[[ -f "$DB" ]] || { echo "❌ accounts.db 不存在"; exit 1; }
-[[ -x "$SHOW_LINK" ]] || { echo "❌ hy2_show_link.sh 不存在"; exit 1; }
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${HY_DOMAIN:?缺少 HY_DOMAIN}"
 
-ID="${ID:-hy2tmp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)}"
-TOKEN="${TOKEN:-$(openssl rand -hex 16)}"
-NOTE="${NOTE:-temp}"
+PORT_START="${PORT_START:-40000}"
+PORT_END="${PORT_END:-50050}"
+ENABLE_SALAMANDER="${ENABLE_SALAMANDER:-0}"
+SALAMANDER_PASSWORD="${SALAMANDER_PASSWORD:-}"
 
-[[ "$ID" != "main" ]] || { echo "❌ ID 不能是 main" >&2; exit 1; }
+[[ "$PORT_START" =~ ^[0-9]+$ && "$PORT_END" =~ ^[0-9]+$ ]] || { echo "❌ 端口范围非法"; exit 1; }
+(( PORT_START >= 1 && PORT_END <= 65535 && PORT_START < PORT_END )) || { echo "❌ 端口范围非法"; exit 1; }
 
-for v in "$ID" "$TOKEN" "$NOTE"; do
-  [[ "$v" != *$'\n'* && "$v" != *$'\r'* && "$v" != *'|'* ]] || { echo "❌ 字段含非法字符"; exit 1; }
+mkdir -p "$TEMP_DIR" "$CERT_DIR"
+
+PIN_SHA256="$("/usr/local/sbin/hy2_temp_gen_cert.sh")"
+[[ -s "$CRT" && -s "$KEY" ]] || { echo "❌ 临时证书生成失败"; exit 1; }
+
+declare -A USED_PORTS=()
+while read -r p; do
+  [[ -n "$p" ]] && USED_PORTS["$p"]=1
+done < <(ss -lunH 2>/dev/null | awk '{print $5}' | sed -E 's/.*:([0-9]+)$/\1/')
+
+shopt -s nullglob
+for f in "${TEMP_DIR}"/hy2-temp-*.meta; do
+  p="$(awk -F= '$1=="PORT"{sub($1"=","");print;exit}' "$f" 2>/dev/null || true)"
+  [[ "$p" =~ ^[0-9]+$ ]] && USED_PORTS["$p"]=1
 done
+shopt -u nullglob
 
-if awk -F'|' -v id="$ID" '$1==id {found=1} END{exit found?0:1}' "$DB"; then
-  echo "❌ 账号已存在: $ID" >&2
-  exit 1
-fi
+PORT="$PORT_START"
+while (( PORT <= PORT_END )); do
+  if [[ -z "${USED_PORTS[$PORT]+x}" ]]; then
+    break
+  fi
+  PORT=$((PORT+1))
+done
+(( PORT <= PORT_END )) || { echo "❌ 没有空闲端口"; exit 1; }
+
+TOKEN="$(openssl rand -hex 16)"
+TAG="hy2-temp-$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 2)"
+CFG="${TEMP_DIR}/${TAG}.yaml"
+META="${TEMP_DIR}/${TAG}.meta"
+UNIT="/etc/systemd/system/${TAG}.service"
 
 NOW=$(date +%s)
 EXP=$((NOW + D))
 
-printf '%s|%s|%s|%s|temp\n' "$ID" "$TOKEN" "$EXP" "$NOTE" >>"$DB"
-chmod 600 "$DB" 2>/dev/null || true
+yaml_quote() {
+  python3 - "$1" <<'PY'
+import sys
+s = sys.argv[1]
+print("'" + s.replace("'", "''") + "'")
+PY
+}
 
-E_STR=$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')
-URL="$("$SHOW_LINK" "$ID")"
+TOKEN_Q="$(yaml_quote "$TOKEN")"
+CRT_Q="$(yaml_quote "$CRT")"
+KEY_Q="$(yaml_quote "$KEY")"
+SALAM_Q="$(yaml_quote "$SALAMANDER_PASSWORD")"
 
-echo "✅ 新 HY2 临时账号: $ID
-域名: $(/usr/local/sbin/hy2_env_get.sh HY_DOMAIN):443
-Token: $TOKEN
+{
+  echo "listen: :${PORT}"
+  echo
+  echo "tls:"
+  echo "  cert: ${CRT_Q}"
+  echo "  key: ${KEY_Q}"
+  echo
+  echo "auth:"
+  echo "  type: password"
+  echo "  password: ${TOKEN_Q}"
+  echo
+  if [[ "$ENABLE_SALAMANDER" == "1" ]]; then
+    echo "obfs:"
+    echo "  type: salamander"
+    echo "  salamander:"
+    echo "    password: ${SALAM_Q}"
+    echo
+  fi
+  echo "speedTest: false"
+  echo "disableUDP: false"
+  echo "udpIdleTimeout: 60s"
+} >"$CFG"
+
+cat >"$META" <<M
+TAG=$TAG
+PORT=$PORT
+TOKEN=$TOKEN
+EXPIRE_EPOCH=$EXP
+PIN_SHA256=$PIN_SHA256
+M
+
+chmod 600 "$CFG" "$META" 2>/dev/null || true
+
+HY_BIN="$(command -v hysteria)"
+cat >"$UNIT" <<U
+[Unit]
+Description=Temp HY2 ${TAG}
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${HY_BIN} server -c ${CFG}
+ExecStopPost=/usr/local/sbin/hy2_cleanup_one.sh ${TAG}
+Restart=no
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
+U
+
+systemctl daemon-reload
+systemctl enable "${TAG}.service" >/dev/null 2>&1 || true
+
+if ! systemctl start "${TAG}.service"; then
+  echo "❌ 启动临时 HY2 服务失败，正在回滚..."
+  HY2_LOCK_HELD=1 FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  exit 1
+fi
+
+sleep 2
+if ! systemctl is-active --quiet "${TAG}.service"; then
+  echo "❌ 临时 HY2 服务未能成功启动"
+  HY2_LOCK_HELD=1 FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  exit 1
+fi
+
+PIN_Q="$(python3 - "$PIN_SHA256" <<'PY'
+import urllib.parse,sys
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PY
+)"
+E_STR="$(TZ=Asia/Shanghai date -d "@$EXP" '+%F %T')"
+
+URL="hy2://${TOKEN}@${HY_DOMAIN}:${PORT}/?insecure=1&pinSHA256=${PIN_Q}#${TAG}"
+if [[ "$ENABLE_SALAMANDER" == "1" ]]; then
+  URL="hy2://${TOKEN}@${HY_DOMAIN}:${PORT}/?insecure=1&pinSHA256=${PIN_Q}&obfs=salamander&obfs-password=${SALAMANDER_PASSWORD}#${TAG}"
+fi
+
+echo "✅ 新 HY2 临时节点: ${TAG}
+地址: ${HY_DOMAIN}:${PORT}/udp
+Token: ${TOKEN}
 有效期: ${D} 秒
 到期(北京时间): ${E_STR}
-链接: ${URL}"
+HY2 链接: ${URL}"
 MK
 chmod +x /usr/local/sbin/hy2_mktemp.sh
 
 ########################################
-# 3) GC
+# 3) 审计脚本
+########################################
+cat >/usr/local/sbin/hy2_audit.sh << 'AUDIT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
+shopt -s nullglob
+
+meta_get() { local file="$1" key="$2"; awk -F= -v k="$key" '$1==k {sub($1"=",""); print; exit}' "$file"; }
+
+TEMP_DIR="/etc/hysteria/temp"
+
+printf "%-40s %-10s %-6s %-12s %-20s\n" "NAME" "STATE" "PORT" "LEFT" "EXPIRE(China)"
+
+if systemctl list-unit-files hy2.service >/dev/null 2>&1; then
+  STATE="$(systemctl is-active hy2.service 2>/dev/null || echo unknown)"
+  printf "%-40s %-10s %-6s %-12s %-20s\n" "hy2.service" "$STATE" "443" "-" "-"
+fi
+
+for META in "$TEMP_DIR"/hy2-temp-*.meta; do
+  TAG="$(meta_get "$META" TAG || true)"
+  PORT="$(meta_get "$META" PORT || true)"
+  EXP="$(meta_get "$META" EXPIRE_EPOCH || true)"
+  [[ -n "$TAG" && -n "$PORT" ]] || continue
+
+  NAME="${TAG}.service"
+  STATE="$(systemctl is-active "$NAME" 2>/dev/null || echo unknown)"
+  NOW="$(date +%s)"
+
+  if [[ "$EXP" =~ ^[0-9]+$ ]]; then
+    LEFT=$((EXP - NOW))
+    if (( LEFT <= 0 )); then
+      LEFT_STR="expired"
+    else
+      D=$((LEFT/86400))
+      H=$(((LEFT%86400)/3600))
+      M=$(((LEFT%3600)/60))
+      LEFT_STR=$(printf "%02dd%02dh%02dm" "$D" "$H" "$M")
+    fi
+    EXPIRE_FMT="$(TZ='Asia/Shanghai' date -d "@${EXP}" '+%Y-%m-%d %H:%M:%S')"
+  else
+    LEFT_STR="N/A"
+    EXPIRE_FMT="N/A"
+  fi
+
+  printf "%-40s %-10s %-6s %-12s %-20s\n" "$NAME" "$STATE" "$PORT" "$LEFT_STR" "$EXPIRE_FMT"
+done
+AUDIT
+chmod +x /usr/local/sbin/hy2_audit.sh
+
+########################################
+# 4) GC
 ########################################
 cat >/usr/local/sbin/hy2_gc.sh << 'GC'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
+shopt -s nullglob
 
-LOCK="/run/hy2-accounts.lock"
+meta_get() { local file="$1" key="$2"; awk -F= -v k="$key" '$1==k {sub($1"=",""); print; exit}' "$file"; }
+
+LOCK="/run/hy2-temp.lock"
 exec 9>"$LOCK"
 flock -n 9 || exit 0
 
-DB="/etc/hysteria/accounts.db"
-TMP="${DB}.tmp"
-
-[[ -f "$DB" ]] || exit 0
-
+TEMP_DIR="/etc/hysteria/temp"
 NOW=$(date +%s)
 
-awk -F'|' -v now="$NOW" '
-BEGIN{OFS="|"}
-{
-  if ($0 ~ /^#/ || NF < 5) { print $0; next }
-  id=$1; token=$2; exp=$3; note=$4; typ=$5
-  if (typ=="temp" && exp ~ /^[0-9]+$/ && exp > 0 && exp <= now) {
-    next
-  }
-  print $0
-}' "$DB" >"$TMP"
+for META in "$TEMP_DIR"/hy2-temp-*.meta; do
+  TAG="$(meta_get "$META" TAG || true)"
+  EXP="$(meta_get "$META" EXPIRE_EPOCH || true)"
+  [[ -n "$TAG" ]] || continue
+  [[ "$EXP" =~ ^[0-9]+$ ]] || continue
 
-mv "$TMP" "$DB"
-chmod 600 "$DB" 2>/dev/null || true
-echo "$(date '+%F %T %Z') gc run" >> /var/log/hy2-gc.log 2>/dev/null || true
+  if (( EXP <= NOW )); then
+    HY2_LOCK_HELD=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+  fi
+done
 GC
 chmod +x /usr/local/sbin/hy2_gc.sh
 
 cat >/etc/systemd/system/hy2-gc.service << 'GCSVC'
 [Unit]
-Description=HY2 Temp Account Garbage Collector
+Description=HY2 Temp Nodes Garbage Collector
 After=network.target
 
 [Service]
@@ -611,7 +729,7 @@ GCSVC
 
 cat >/etc/systemd/system/hy2-gc.timer << 'GCTMR'
 [Unit]
-Description=Run HY2 temp account GC every 15 minutes
+Description=Run HY2 temp node GC every 15 minutes
 
 [Timer]
 OnBootSec=5min
@@ -623,131 +741,55 @@ WantedBy=timers.target
 GCTMR
 
 systemctl daemon-reload
-systemctl enable --now hy2-gc.timer || true
+systemctl enable --now hy2-gc.timer >/dev/null 2>&1 || true
 
 ########################################
-# 4) 审计
-########################################
-cat >/usr/local/sbin/hy2_audit.sh << 'AUDIT'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
-
-DB="/etc/hysteria/accounts.db"
-SVC="hy2.service"
-
-[[ -f "$DB" ]] || { echo "❌ accounts.db 不存在"; exit 1; }
-
-SVC_STATE="$(systemctl is-active "$SVC" 2>/dev/null || echo unknown)"
-echo "服务状态: ${SVC_STATE}"
-printf "%-28s %-8s %-10s %-12s %-20s\n" "ID" "TYPE" "STATE" "LEFT" "NOTE"
-
-NOW=$(date +%s)
-
-while IFS='|' read -r ID TOKEN EXPIRE_EPOCH NOTE TYPE; do
-  [[ -z "${ID:-}" ]] && continue
-  [[ "${ID:0:1}" == "#" ]] && continue
-
-  STATE="ok"
-  LEFT="-"
-
-  if [[ "$EXPIRE_EPOCH" =~ ^[0-9]+$ ]] && (( EXPIRE_EPOCH > 0 )); then
-    REMAIN=$((EXPIRE_EPOCH - NOW))
-    if (( REMAIN <= 0 )); then
-      STATE="expired"
-      LEFT="expired"
-    else
-      D=$((REMAIN/86400))
-      H=$(((REMAIN%86400)/3600))
-      M=$(((REMAIN%3600)/60))
-      LEFT=$(printf "%02dd%02dh%02dm" "$D" "$H" "$M")
-    fi
-  fi
-
-  printf "%-28s %-8s %-10s %-12s %-20s\n" "$ID" "$TYPE" "$STATE" "$LEFT" "$NOTE"
-done <"$DB"
-AUDIT
-chmod +x /usr/local/sbin/hy2_audit.sh
-
-########################################
-# 5) 清空全部临时账号
+# 5) 清空全部临时节点
 ########################################
 cat >/usr/local/sbin/hy2_clear_all.sh << 'CLR'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
+shopt -s nullglob
 
-LOCK="/run/hy2-accounts.lock"
+meta_get() { local file="$1" key="$2"; awk -F= -v k="$key" '$1==k {sub($1"=",""); print; exit}' "$file"; }
+
+LOCK="/run/hy2-temp.lock"
 exec 9>"$LOCK"
-flock -w 15 9
+flock -w 10 9
 
-DB="/etc/hysteria/accounts.db"
-TMP="${DB}.tmp"
+TEMP_DIR="/etc/hysteria/temp"
 
-[[ -f "$DB" ]] || { echo "❌ accounts.db 不存在"; exit 1; }
+META_FILES=("$TEMP_DIR"/hy2-temp-*.meta)
+if (( ${#META_FILES[@]} == 0 )); then
+  echo "当前没有任何临时 HY2 节点。"
+  exit 0
+fi
 
-awk -F'|' '
-BEGIN{OFS="|"}
-($5 != "temp") { print $0 }
-' "$DB" >"$TMP"
+for META in "${META_FILES[@]}"; do
+  TAG="$(meta_get "$META" TAG || true)"
+  [[ -n "$TAG" ]] || continue
+  HY2_LOCK_HELD=1 FORCE=1 /usr/local/sbin/hy2_cleanup_one.sh "$TAG" || true
+done
 
-mv "$TMP" "$DB"
-chmod 600 "$DB" 2>/dev/null || true
-
-echo "✅ 所有临时 HY2 账号已清理。"
+echo "✅ 所有临时 HY2 节点已清理。"
 CLR
 chmod +x /usr/local/sbin/hy2_clear_all.sh
 
-echo "✅ HY2 临时账号 + 审计 + GC 已部署完成。"
-
-cat <<USE
-============ 使用方法（HY2 临时账号 / 审计） ============
-
-1) 新建一个临时 HY2 账号（例如 600 秒）：
-   D=600 hy2_mktemp.sh
-
-   # 自定义 ID / Token / 备注：
-   ID=test01 TOKEN=1234567890abcdef1234567890abcdef NOTE=guest D=600 hy2_mktemp.sh
-
-2) 查看主账号 + 所有临时账号状态：
-   hy2_audit.sh
-
-3) 正常情况下：
-   - hy2-gc.timer 每 15 分钟自动清理到期账号
-   - 即使 GC 还没执行，过期账号也会被认证后端直接拒绝
-
-4) 手动强制清空所有临时账号：
-   hy2_clear_all.sh
-
-5) 手动清理某一个临时账号：
-   hy2_cleanup_one.sh 账号ID
-
-6) 重新查看某个账号的分享链接：
-   hy2_show_link.sh 账号ID
-========================================================
-USE
+echo "✅ HY2 临时高端口系统已部署完成。"
 EOF
 
-  chmod +x /root/hy2_temp_user_all.sh
+  chmod +x /root/hy2_temp_port_all.sh
 }
-
-# ------------------ 4. UDP 端口配额（HY2 推荐主要用于 443） ------------------
 
 install_port_quota() {
   echo "🧩 部署 UDP 双向配额系统（nftables，仅统计 VPS<->用户，不包含网站流量）..."
   mkdir -p /etc/portquota
-
   systemctl enable --now nftables >/dev/null 2>&1 || true
 
-  if ! nft list table inet portquota >/dev/null 2>&1; then
-    nft add table inet portquota
-  fi
-  if ! nft list chain inet portquota down_out >/dev/null 2>&1; then
-    nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
-  fi
-  if ! nft list chain inet portquota up_in >/dev/null 2>&1; then
-    nft add chain inet portquota up_in '{ type filter hook input priority filter; policy accept; }'
-  fi
+  nft list table inet portquota >/dev/null 2>&1 || nft add table inet portquota
+  nft list chain inet portquota down_out >/dev/null 2>&1 || nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
+  nft list chain inet portquota up_in >/dev/null 2>&1 || nft add chain inet portquota up_in '{ type filter hook input priority filter; policy accept; }'
 
   cat >/usr/local/sbin/pq_save.sh <<'SAVE'
 #!/usr/bin/env bash
@@ -781,7 +823,6 @@ if [[ -f /etc/nftables.conf ]]; then
 fi
 SAVE
   chmod +x /usr/local/sbin/pq_save.sh
-
   /usr/local/sbin/pq_save.sh >/dev/null 2>&1 || true
 
   cat >/usr/local/sbin/pq_add.sh <<'ADD'
@@ -801,36 +842,21 @@ if ! [[ "$GIB" =~ ^[0-9]+$ ]]; then
 fi
 
 BYTES=$((GIB * 1024 * 1024 * 1024))
-
 LOCK="/run/portquota.lock"
 exec 9>"$LOCK"
 flock -w 10 9
 
-if ! nft list table inet portquota >/dev/null 2>&1; then
-  nft add table inet portquota
-fi
-if ! nft list chain inet portquota down_out >/dev/null 2>&1; then
-  nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
-fi
-if ! nft list chain inet portquota up_in >/dev/null 2>&1; then
-  nft add chain inet portquota up_in '{ type filter hook input priority filter; policy accept; }'
-fi
+nft list table inet portquota >/dev/null 2>&1 || nft add table inet portquota
+nft list chain inet portquota down_out >/dev/null 2>&1 || nft add chain inet portquota down_out '{ type filter hook output priority filter; policy accept; }'
+nft list chain inet portquota up_in >/dev/null 2>&1 || nft add chain inet portquota up_in '{ type filter hook input priority filter; policy accept; }'
 
 nft -a list chain inet portquota down_out 2>/dev/null | \
- awk -v p="$PORT" '
-   $0 ~ "comment \"pq-count-out-"p"\"" ||
-   $0 ~ "comment \"pq-drop-out-"p"\""  {print $NF}
- ' | while read -r h; do
-   nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
- done
+ awk -v p="$PORT" '$0 ~ "comment \"pq-count-out-"p"\"" || $0 ~ "comment \"pq-drop-out-"p"\"" {print $NF}' | \
+ while read -r h; do nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true; done
 
 nft -a list chain inet portquota up_in 2>/dev/null | \
- awk -v p="$PORT" '
-   $0 ~ "comment \"pq-count-in-"p"\"" ||
-   $0 ~ "comment \"pq-drop-in-"p"\""  {print $NF}
- ' | while read -r h; do
-   nft delete rule inet portquota up_in handle "$h" 2>/dev/null || true
- done
+ awk -v p="$PORT" '$0 ~ "comment \"pq-count-in-"p"\"" || $0 ~ "comment \"pq-drop-in-"p"\"" {print $NF}' | \
+ while read -r h; do nft delete rule inet portquota up_in handle "$h" 2>/dev/null || true; done
 
 nft delete counter inet portquota "pq_out_$PORT" 2>/dev/null || true
 nft delete counter inet portquota "pq_in_$PORT" 2>/dev/null || true
@@ -860,8 +886,7 @@ M
 
 PQ_LOCK_HELD=1 /usr/local/sbin/pq_save.sh
 systemctl enable --now nftables >/dev/null 2>&1 || true
-
-echo "✅ 已为端口 $PORT 设置限额 ${GIB}GiB（统计=VPS<->用户 UDP 双向合计；网站流量不计）"
+echo "✅ 已为端口 $PORT 设置限额 ${GIB}GiB（UDP 双向合计）"
 ADD
   chmod +x /usr/local/sbin/pq_add.sh
 
@@ -869,12 +894,8 @@ ADD
 #!/usr/bin/env bash
 set -Eeuo pipefail
 trap 'echo "❌ ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
-
 PORT="${1:-}"
-if [[ -z "$PORT" ]]; then echo "用法: pq_del.sh <端口>" >&2; exit 1; fi
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
-  echo "❌ 端口必须是 1-65535 的整数" >&2; exit 1
-fi
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "用法: pq_del.sh <端口>" >&2; exit 1; }
 
 LOCK="/run/portquota.lock"
 exec 9>"$LOCK"
@@ -882,33 +903,21 @@ flock -w 10 9
 
 if nft list chain inet portquota down_out >/dev/null 2>&1; then
   nft -a list chain inet portquota down_out 2>/dev/null | \
-   awk -v p="$PORT" '
-     $0 ~ "comment \"pq-count-out-"p"\"" ||
-     $0 ~ "comment \"pq-drop-out-"p"\""  {print $NF}
-   ' | while read -r h; do
-     nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true
-   done
+   awk -v p="$PORT" '$0 ~ "comment \"pq-count-out-"p"\"" || $0 ~ "comment \"pq-drop-out-"p"\"" {print $NF}' | \
+   while read -r h; do nft delete rule inet portquota down_out handle "$h" 2>/dev/null || true; done
 fi
-
 if nft list chain inet portquota up_in >/dev/null 2>&1; then
   nft -a list chain inet portquota up_in 2>/dev/null | \
-   awk -v p="$PORT" '
-     $0 ~ "comment \"pq-count-in-"p"\"" ||
-     $0 ~ "comment \"pq-drop-in-"p"\""  {print $NF}
-   ' | while read -r h; do
-     nft delete rule inet portquota up_in handle "$h" 2>/dev/null || true
-   done
+   awk -v p="$PORT" '$0 ~ "comment \"pq-count-in-"p"\"" || $0 ~ "comment \"pq-drop-in-"p"\"" {print $NF}' | \
+   while read -r h; do nft delete rule inet portquota up_in handle "$h" 2>/dev/null || true; done
 fi
 
 nft delete counter inet portquota "pq_out_$PORT" 2>/dev/null || true
 nft delete counter inet portquota "pq_in_$PORT" 2>/dev/null || true
 nft delete quota   inet portquota "pq_quota_$PORT" 2>/dev/null || true
-
 rm -f /etc/portquota/pq-"$PORT".meta
 PQ_LOCK_HELD=1 /usr/local/sbin/pq_save.sh
-systemctl enable --now nftables >/dev/null 2>&1 || true
-
-echo "✅ 已删除端口 $PORT 的配额（UDP 双向统计/限额）"
+echo "✅ 已删除端口 $PORT 的配额"
 DEL
   chmod +x /usr/local/sbin/pq_del.sh
 
@@ -925,14 +934,12 @@ printf "%-8s %-8s %-12s %-12s %-12s %-12s %-8s %-10s\n" \
 
 get_counter_bytes() {
   local obj="$1"
-  nft list counter inet portquota "$obj" 2>/dev/null \
-    | awk '/bytes/{for(i=1;i<=NF;i++)if($i=="bytes"){print $(i+1);exit}}'
+  nft list counter inet portquota "$obj" 2>/dev/null | awk '/bytes/{for(i=1;i<=NF;i++)if($i=="bytes"){print $(i+1);exit}}'
 }
 
 get_quota_used_bytes() {
   local obj="$1"
-  nft list quota inet portquota "$obj" 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i=="used"){print $(i+1); exit}}'
+  nft list quota inet portquota "$obj" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){print $(i+1); exit}}'
 }
 
 for META in /etc/portquota/pq-*.meta; do
@@ -995,7 +1002,7 @@ AUDIT
 
   cat >/etc/systemd/system/pq-save.service <<'PQSVC'
 [Unit]
-Description=Save nftables portquota table (with counters/quotas)
+Description=Save nftables portquota table
 
 [Service]
 Type=oneshot
@@ -1017,23 +1024,7 @@ PQTMR
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable --now pq-save.timer >/dev/null 2>&1 || true
-
-  cat <<USE
-============ 使用方法（UDP 双向配额 / 审计，HY2 推荐主要用于 443） ============
-
-1) 为 443 端口添加配额（例如总计 500GiB，双向合计）：
-   pq_add.sh 443 500
-
-2) 查看所有端口使用情况（下行/上行/合计）：
-   pq_audit.sh
-
-3) 删除某个端口的配额：
-   pq_del.sh 443
-=============================================================================
-USE
 }
-
-# ------------------ 5. 日志轮转（保留 2 天） ------------------
 
 install_logrotate_rules() {
   echo "🧩 写入 logrotate 规则（保留 2 天，压缩）..."
@@ -1051,8 +1042,6 @@ install_logrotate_rules() {
 }
 LR
 }
-
-# ------------------ 6. systemd-journald 清理（保留 2 天） ------------------
 
 install_journal_vacuum() {
   echo "🧩 设置 systemd journal 自动清理（保留 2 天）..."
@@ -1081,16 +1070,14 @@ TMR
   systemctl enable --now journal-vacuum.timer >/dev/null 2>&1 || true
 }
 
-# ------------------ 主流程 ------------------
-
 main() {
   check_debian12
   need_basic_tools
   download_upstreams
 
   install_update_all
-  install_hy2_script
-  install_hy2_temp_audit
+  install_hy2_main_script
+  install_hy2_temp_system
   install_port_quota
   install_logrotate_rules
   install_journal_vacuum
@@ -1105,46 +1092,31 @@ main() {
    update-all
    reboot
 
-2) HY2 主节点（普通 ACME / 自定义伪装目标）：
-   export ACME_EMAIL='你的邮箱'
-   export MASQ_URL='https://你自己选的伪装站点'
-   # 可选：
-   # export ENABLE_SALAMANDER='0'
-   # export SALAMANDER_PASSWORD='你的混淆密码'
-   bash /root/onekey_hy2_acme.sh
+2) 编辑主 HY2 配置：
+   nano /etc/default/hy2-main
 
-3) HY2 临时账号 + 审计 + GC（同一 443 端口）：
-   bash /root/hy2_temp_user_all.sh
+3) 主 HY2 节点（443 + ACME + masquerade）：
+   bash /root/onekey_hy2_main_acme.sh
 
-   # 部署后：
+4) 临时高端口系统（只需部署一次）：
+   bash /root/hy2_temp_port_all.sh
+
+   部署后：
    D=600 hy2_mktemp.sh
-   ID=test01 TOKEN=1234567890abcdef1234567890abcdef NOTE=guest D=600 hy2_mktemp.sh
+   PORT_START=40000 PORT_END=60000 D=600 hy2_mktemp.sh
 
    hy2_audit.sh
    hy2_clear_all.sh
-   hy2_cleanup_one.sh 账号ID
-   hy2_show_link.sh 账号ID
+   FORCE=1 hy2_cleanup_one.sh hy2-temp-YYYYMMDDHHMMSS-ABCD
 
-4) UDP 端口配额（nftables + 5 分钟保存快照）：
+5) UDP 配额系统：
    pq_add.sh 443 500
+   pq_add.sh 40000 50
    pq_audit.sh
-   pq_del.sh 443
-
-5) 日志轮转（保留最近 2 天）：
-   - /var/log/pq-save.log
-   - /var/log/hy2-gc.log
-   配置文件：/etc/logrotate.d/hy2-tools
+   pq_del.sh 40000
 
 6) systemd journal 自动清理（保留 2 天）：
    systemctl status journal-vacuum.timer
-
-🎯 建议顺序：
-   1) update-all && reboot
-   2) export ACME_EMAIL='你的邮箱'
-   3) export MASQ_URL='https://你自己选的伪装站点'
-   4) bash /root/onekey_hy2_acme.sh
-   5) bash /root/hy2_temp_user_all.sh
-   6) 需要限额就 pq_add.sh 443 500
 ==================================================
 DONE
 }
