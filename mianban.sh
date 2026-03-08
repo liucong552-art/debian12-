@@ -6,6 +6,7 @@ die(){ echo -e "\n[x] $*\n" >&2; exit 1; }
 log(){ echo -e "\n[+] $*\n"; }
 
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行"
+
 [ -n "${ADMIN_EMAIL:-}" ] || die "缺少 ADMIN_EMAIL"
 [ -n "${PANEL_DOMAIN:-}" ] || die "缺少 PANEL_DOMAIN"
 [ -n "${API_DOMAIN:-}" ] || die "缺少 API_DOMAIN"
@@ -14,6 +15,11 @@ log(){ echo -e "\n[+] $*\n"; }
 if [ -z "${SSH_PORT:-}" ]; then
   SSH_PORT="22"
 fi
+
+case "${TUNNEL_TOKEN}" in
+  eyJ*) ;;
+  *) die "TUNNEL_TOKEN 看起来不是合法 token（应为 eyJ 开头的长字符串）" ;;
+esac
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -49,7 +55,6 @@ if [ ! -f /opt/Xboard/.xboard_installed ]; then
     -e ENABLE_REDIS=false \
     -e ADMIN_ACCOUNT="${ADMIN_EMAIL}" \
     web php artisan xboard:install | tee /opt/xboard_install.log
-
   touch /opt/Xboard/.xboard_installed
 else
   log "检测到已初始化，跳过 xboard:install"
@@ -62,7 +67,7 @@ ids="$(docker compose ps -q)"
 [ -n "${ids}" ] || die "Xboard 容器没有成功启动"
 docker update --restart unless-stopped ${ids} >/dev/null
 
-log "写入开机自启 systemd 单元"
+log "写入 Xboard 开机自启 systemd 单元"
 cat > /etc/systemd/system/xboard-compose.service <<'EOF'
 [Unit]
 Description=Xboard Compose Stack
@@ -88,13 +93,26 @@ systemctl enable --now xboard-compose
 log "安装 cloudflared"
 mkdir -p --mode=0755 /usr/share/keyrings
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main" > /etc/apt/sources.list.d/cloudflared.list
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
 apt-get update -y
 apt-get install -y cloudflared
 
-log "绑定并启动 Tunnel"
-cloudflared service uninstall >/dev/null 2>&1 || true
-cloudflared service install "${TUNNEL_TOKEN}"
+log "检查并写入 cloudflared service"
+need_install=1
+if [ -f /etc/systemd/system/cloudflared.service ]; then
+  if grep -q -- "${TUNNEL_TOKEN}" /etc/systemd/system/cloudflared.service 2>/dev/null; then
+    need_install=0
+  fi
+fi
+
+if [ "${need_install}" = "1" ]; then
+  log "安装/更新 Tunnel service"
+  systemctl stop cloudflared >/dev/null 2>&1 || true
+  cloudflared service uninstall >/dev/null 2>&1 || true
+  cloudflared service install "${TUNNEL_TOKEN}"
+fi
+
+systemctl daemon-reload
 systemctl enable --now cloudflared
 
 log "配置 nftables，仅保留 SSH 入站"
@@ -140,7 +158,6 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
-
 [ "${ok}" = "1" ] || die "本地 http://127.0.0.1:7001 仍未就绪"
 
 echo
@@ -149,7 +166,7 @@ echo "面板地址: https://${PANEL_DOMAIN}"
 echo "节点 API: https://${API_DOMAIN}"
 echo "Xboard 目录: /opt/Xboard"
 echo "安装日志: /opt/xboard_install.log"
-echo "查看面板状态: cd /opt/Xboard && docker compose ps"
-echo "查看 Tunnel 状态: systemctl status cloudflared --no-pager"
-echo "查看本地 7001: curl -I http://127.0.0.1:7001"
+echo "本机检测: curl -I http://127.0.0.1:7001"
+echo "面板状态: cd /opt/Xboard && docker compose ps"
+echo "Tunnel 状态: systemctl status cloudflared --no-pager"
 echo "======================================================"
