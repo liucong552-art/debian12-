@@ -29,6 +29,11 @@ mkdir -p /etc/XrayR /var/log/XrayR /usr/local/bin
 
 log "下载你的自编译 XrayR 二进制"
 curl -fL "$BIN_URL" -o /usr/local/bin/xrayr
+
+if [ -n "${BIN_SHA256:-}" ]; then
+  echo "${BIN_SHA256}  /usr/local/bin/xrayr" | sha256sum -c -
+fi
+
 chmod 755 /usr/local/bin/xrayr
 /usr/local/bin/xrayr version || true
 
@@ -91,17 +96,17 @@ health_check() {
   base="\${API_HOST%/}/api/v1/server/UniProxy/config?node_id=\${NODE_ID}&node_type=vless"
 
   code="\$(curl -m 8 -sS -o /dev/null -w "%{http_code}" -H "Token: \${API_KEY}" "\${base}" || echo 000)"
-  if [[ "\${code}" == "200" ]]; then
+  if [[ "\${code}" == "200" || "\${code}" == "304" ]]; then
     return 0
   fi
 
   code="\$(curl -m 8 -sS -o /dev/null -w "%{http_code}" "\${base}&token=\${API_KEY}" || echo 000)"
-  [[ "\${code}" == "200" ]]
+  [[ "\${code}" == "200" || "\${code}" == "304" ]]
 }
 
 while true; do
   if ! health_check; then
-    echo "[runner] panel api not ready (HTTP != 200), retry in 3s" >> "\${LOG}"
+    echo "[runner] panel api not ready (HTTP != 200/304), retry in 3s" >> "\${LOG}"
     sleep 3
     continue
   fi
@@ -112,7 +117,7 @@ while true; do
 done
 EOF
 
-chmod +x /usr/local/bin/xrayr-runner
+chmod 700 /usr/local/bin/xrayr-runner
 
 log "写入 systemd 服务"
 cat > /etc/systemd/system/xrayr.service <<EOF
@@ -144,13 +149,12 @@ echo
 echo "======================================================"
 echo "已固定使用 BIN_URL:"
 echo "  ${BIN_URL}"
-echo
-echo "面板 API:"
-echo "  ${PANEL_HOST}"
-echo
-echo "节点 ID:"
-echo "  ${NODE_ID}"
-echo
+if [ -n "${BIN_SHA256:-}" ]; then
+  echo "已校验 SHA256:"
+  echo "  ${BIN_SHA256}"
+fi
+echo "面板 API: ${PANEL_HOST}"
+echo "节点 ID: ${NODE_ID}"
 echo "查看状态:"
 echo "  systemctl status xrayr --no-pager"
 echo "  journalctl -u xrayr -n 100 --no-pager"
