@@ -7,187 +7,172 @@ die(){ echo -e "\n[x] $*\n" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行"
 
-[ -n "${ADMIN_EMAIL:-}" ] || die "缺少 ADMIN_EMAIL"
-[ -n "${TUNNEL_TOKEN:-}" ] || die "缺少 TUNNEL_TOKEN"
+PANEL_HOST="${PANEL_HOST:-}"
+API_KEY="${API_KEY:-}"
+NODE_ID="${NODE_ID:-}"
 
-PANEL_DOMAIN="${PANEL_DOMAIN:-panel.liucna.com}"
-API_DOMAIN="${API_DOMAIN:-api.liucna.com}"
-SSH_PORT="${SSH_PORT:-22}"
-PANEL_PORT="${PANEL_PORT:-7001}"
-BRIDGE_PORT="${BRIDGE_PORT:-7002}"
+UPDATE_PERIODIC="${UPDATE_PERIODIC:-60}"
+GO_VER="${GO_VER:-1.25.3}"
+XRAYR_COMMIT="${XRAYR_COMMIT:-dd786ef}"
 
-case "${TUNNEL_TOKEN}" in
-  eyJ*) ;;
-  *) die "TUNNEL_TOKEN 看起来不合法（应为 eyJ 开头）" ;;
-esac
+[ -n "${PANEL_HOST}" ] || die "缺少 PANEL_HOST，例如 https://api.liucna.com"
+[ -n "${API_KEY}" ]   || die "缺少 API_KEY"
+[ -n "${NODE_ID}" ]   || die "缺少 NODE_ID"
 
 export DEBIAN_FRONTEND=noninteractive
 
-log "安装基础依赖"
+log "Step 1/8: 安装依赖"
 apt-get update -y
-apt-get install -y curl ca-certificates git unzip nginx nftables
+apt-get install -y git curl ca-certificates jq build-essential iproute2 unzip
 
-log "安装 Docker"
-if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | bash
+log "Step 2/8: 安装 Go ${GO_VER}"
+arch="$(uname -m)"
+case "${arch}" in
+  x86_64|amd64) go_arch="amd64" ;;
+  aarch64|arm64) go_arch="arm64" ;;
+  *) die "不支持的架构: ${arch}" ;;
+esac
+
+if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "go${GO_VER}"; then
+  rm -rf /usr/local/go
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fL --retry 5 --retry-delay 2 -o "$tmp/go.tgz" "https://go.dev/dl/go${GO_VER}.linux-${go_arch}.tar.gz" || \
+  curl -fL --retry 5 --retry-delay 2 -o "$tmp/go.tgz" "https://dl.google.com/go/go${GO_VER}.linux-${go_arch}.tar.gz"
+  tar -C /usr/local -xzf "$tmp/go.tgz"
 fi
-apt-get install -y docker-compose-plugin >/dev/null 2>&1 || true
-systemctl enable --now docker
+export PATH="/usr/local/go/bin:$PATH"
+go version
 
-log "准备 Xboard 代码"
-if [ -d /opt/Xboard/.git ]; then
-  cd /opt/Xboard
-  git fetch --depth 1 origin compose
-  git checkout -f compose
-  git reset --hard origin/compose
-else
-  rm -rf /opt/Xboard
-  git clone -b compose --depth 1 https://github.com/cedar2025/Xboard /opt/Xboard
+log "Step 3/8: 拉取 XrayR 并 checkout ${XRAYR_COMMIT}"
+mkdir -p /usr/local/src
+if [ ! -d /usr/local/src/XrayR/.git ]; then
+  git clone https://github.com/XrayR-project/XrayR.git /usr/local/src/XrayR
+fi
+cd /usr/local/src/XrayR
+git fetch --all --tags
+git checkout -f "${XRAYR_COMMIT}"
+
+log "Step 4/8: 打补丁（复刻原成功方案）"
+if grep -q 'log.Panicf("Panel Start failed: %s", err)' panel/panel.go 2>/dev/null; then
+  sed -i 's/log\.Panicf("Panel Start failed: %s", err)/log.Errorf("Panel Start warning: %s", err)/' panel/panel.go
 fi
 
-cd /opt/Xboard
-docker compose pull || true
-
-if [ ! -f /opt/Xboard/.xboard_installed ]; then
-  log "首次初始化 Xboard（SQLite + Docker 内置 Redis）"
-  docker compose run --rm \
-    -e ENABLE_SQLITE=true \
-    -e ENABLE_REDIS=true \
-    -e ADMIN_ACCOUNT="${ADMIN_EMAIL}" \
-    web php artisan xboard:install | tee /opt/xboard_install.log
-  touch /opt/Xboard/.xboard_installed
-else
-  log "检测到已初始化，跳过 xboard:install"
+if grep -q 'return nil, errors.New("users is null")' api/newV2board/v2board.go 2>/dev/null; then
+  sed -i 's/return nil, errors.New("users is null")/return \&[]api.UserInfo{}, nil/' api/newV2board/v2board.go
 fi
 
-log "启动 Xboard"
-docker compose up -d
+log "Step 5/8: 编译安装 xrayr（dd786ef + 补丁）"
+go build -o XrayR -ldflags "-s -w" .
+install -m 0755 XrayR /usr/local/bin/xrayr
 
-ids="$(docker compose ps -q)"
-[ -n "${ids}" ] || die "Xboard 容器没有成功启动"
-docker update --restart unless-stopped ${ids} >/dev/null
+log "Step 6/8: 写入 /etc/XrayR/config.yml"
+mkdir -p /etc/XrayR
+cat >/etc/XrayR/config.yml <<EOF
+Log:
+  Level: warning
 
-log "写入 Xboard 开机自启 systemd 单元"
-cat >/etc/systemd/system/xboard-compose.service <<'EOF'
+ConnectionConfig:
+  Handshake: 4
+  ConnIdle: 10
+  UplinkOnly: 2
+  DownlinkOnly: 4
+  BufferSize: 64
+
+Nodes:
+  - PanelType: "NewV2board"
+    ApiConfig:
+      ApiHost: "${PANEL_HOST}"
+      ApiKey: "${API_KEY}"
+      NodeID: ${NODE_ID}
+      NodeType: Vless
+      Timeout: 30
+      EnableVless: true
+      EnableXTLS: true
+      VlessFlow: "xtls-rprx-vision"
+    ControllerConfig:
+      ListenIP: 0.0.0.0
+      SendIP: 0.0.0.0
+      UpdatePeriodic: ${UPDATE_PERIODIC}
+      EnableDNS: false
+      DNSType: AsIs
+
+      DisableLocalREALITYConfig: true
+      EnableREALITY: false
+      REALITYConfigs:
+        Show: false
+
+      CertConfig:
+        CertMode: none
+EOF
+
+chmod 600 /etc/XrayR/config.yml
+
+log "Step 6.1/8: 写入稳定 runner"
+install -d /var/log/XrayR
+: >/var/log/XrayR/runner.log
+
+cat >/usr/local/bin/xrayr-runner <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+mkdir -p /var/log/XrayR
+LOG=/var/log/XrayR/runner.log
+CFG=/etc/XrayR/config.yml
+
+echo "[runner] start $(date -Is)" >>"$LOG"
+while true; do
+  /usr/local/bin/xrayr --config "$CFG" >>"$LOG" 2>&1 || true
+  echo "[runner] xrayr exited at $(date -Is), retry in 3s" >>"$LOG"
+  sleep 3
+done
+EOF
+chmod +x /usr/local/bin/xrayr-runner
+
+log "Step 6.2/8: 写入 systemd"
+cat >/etc/systemd/system/xrayr.service <<'EOF'
 [Unit]
-Description=Xboard Compose Stack
-After=network-online.target docker.service
-Wants=network-online.target docker.service
-Requires=docker.service
+Description=XrayR Service (stable runner)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/opt/Xboard
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose stop
-ExecReload=/usr/bin/docker compose up -d
+Type=simple
+ExecStart=/usr/local/bin/xrayr-runner
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+log "Step 7/8: 启动服务"
 systemctl daemon-reload
-systemctl enable --now xboard-compose
+systemctl enable --now xrayr
+systemctl restart xrayr
 
-log "写入 token-bridge（127.0.0.1:${BRIDGE_PORT} -> 127.0.0.1:${PANEL_PORT}）"
-rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default || true
+log "Step 8/8: 自检"
+echo "[i] 拉 config："
+cfg="$(curl -fsS "${PANEL_HOST}/api/v1/server/UniProxy/config?node_id=${NODE_ID}&node_type=vless&token=${API_KEY}" || true)"
+echo "${cfg}" | jq . || true
 
-cat >/etc/nginx/conf.d/xboard_token_bridge.conf <<EOF
-server {
-  listen 127.0.0.1:${BRIDGE_PORT};
-  server_name _;
-
-  location / {
-    set \$token \$arg_token;
-    if (\$token = "") { set \$token \$http_token; }
-    if (\$token = "") { return 400; }
-
-    if (\$arg_token = "") { set \$args "\${args}&token=\${token}"; }
-    if (\$args ~ "^&")    { set \$args "token=\${token}"; }
-
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_set_header Host 127.0.0.1;
-
-    proxy_pass http://127.0.0.1:${PANEL_PORT}\$uri?\$args;
-  }
-}
-EOF
-
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
-
-log "安装 cloudflared"
-mkdir -p --mode=0755 /usr/share/keyrings
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
-apt-get update -y
-apt-get install -y cloudflared
-
-log "安装/更新 Tunnel service"
-need_install=1
-if [ -f /etc/systemd/system/cloudflared.service ]; then
-  if grep -q -- "${TUNNEL_TOKEN}" /etc/systemd/system/cloudflared.service 2>/dev/null; then
-    need_install=0
-  fi
+port="$(echo "${cfg}" | jq -r '.server_port // empty' 2>/dev/null || true)"
+if [ -n "${port}" ] && [ "${port}" != "null" ]; then
+  echo "[i] 检查监听端口: ${port}"
+  ss -lntp | grep ":${port}" || true
 fi
 
-if [ "${need_install}" = "1" ]; then
-  systemctl stop cloudflared >/dev/null 2>&1 || true
-  cloudflared service uninstall >/dev/null 2>&1 || true
-  cloudflared service install "${TUNNEL_TOKEN}"
-fi
-
-systemctl daemon-reload
-systemctl enable --now cloudflared
-
-log "配置 nftables（只开 SSH 入站；7001/7002 不对公网开放）"
-cat >/etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-  chain input {
-    type filter hook input priority 0;
-    policy drop;
-
-    iif "lo" accept
-    ct state established,related accept
-
-    tcp dport ${SSH_PORT} accept
-    ip protocol icmp accept
-    ip6 nexthdr ipv6-icmp accept
-  }
-
-  chain forward {
-    type filter hook forward priority 0;
-    policy drop;
-  }
-
-  chain output {
-    type filter hook output priority 0;
-    policy accept;
-  }
-}
-EOF
-
-systemctl enable --now nftables
-nft -f /etc/nftables.conf
-
-log "自检本地服务"
-curl -fsS -I "http://127.0.0.1:${PANEL_PORT}" >/dev/null || die "本地 Xboard ${PANEL_PORT} 不通"
-curl -fsS -I "http://127.0.0.1:${BRIDGE_PORT}/api/v1/guest/comm/config" >/dev/null || true
+echo "[i] 拉 user："
+curl -fsS "${PANEL_HOST}/api/v1/server/UniProxy/user?node_id=${NODE_ID}&node_type=vless&token=${API_KEY}" | jq . || true
 
 echo
 echo "======================================================"
-echo "面板域名: https://${PANEL_DOMAIN}"
-echo "节点 API 域名: https://${API_DOMAIN}"
-echo "本地面板: http://127.0.0.1:${PANEL_PORT}"
-echo "本地 bridge: http://127.0.0.1:${BRIDGE_PORT}"
-echo "Xboard 目录: /opt/Xboard"
-echo "安装日志: /opt/xboard_install.log"
-echo "面板状态: cd /opt/Xboard && docker compose ps"
-echo "Tunnel 状态: systemctl status cloudflared --no-pager"
+echo "PANEL_HOST: ${PANEL_HOST}"
+echo "NODE_ID: ${NODE_ID}"
+echo "XRAYR_COMMIT: ${XRAYR_COMMIT}"
+echo "查看状态:"
+echo "  systemctl status xrayr --no-pager"
+echo "  journalctl -u xrayr -n 100 --no-pager"
+echo "  tail -n 100 /var/log/XrayR/runner.log"
 echo "======================================================"
