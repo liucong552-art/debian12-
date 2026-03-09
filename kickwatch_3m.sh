@@ -11,6 +11,7 @@ log(){ echo -e "\n[+] $*\n"; }
 PANEL_HOST="${PANEL_HOST:-}"
 API_KEY="${API_KEY:-}"
 NODE_ID="${NODE_ID:-}"
+
 # ===== 可选 =====
 NODE_TYPE="${NODE_TYPE:-vless}"
 PORT="${PORT:-8443}"
@@ -40,11 +41,11 @@ systemctl disable --now xrayr-kickwatch 2>/dev/null || true
 rm -f /etc/systemd/system/xrayr-kickwatch.service /usr/local/bin/xrayr-kickwatch.sh
 nft delete table inet xraykick 2>/dev/null || true
 
-log "3) 配置 nftables（拉黑集合 timeout=$BAN_TTL，仅封端口 $PORT）"
+log "3) 配置 nftables（硬踢：RST + conntrack 删除；仅封端口 $PORT）"
 nft add table inet xraykick 2>/dev/null || true
 nft "add set inet xraykick blocked4 { type ipv4_addr; flags timeout; timeout ${BAN_TTL}; }" 2>/dev/null || true
 nft 'add chain inet xraykick input { type filter hook input priority -150; policy accept; }' 2>/dev/null || true
-nft add rule inet xraykick input tcp dport $PORT ip saddr @blocked4 drop 2>/dev/null || true
+nft add rule inet xraykick input tcp dport $PORT ip saddr @blocked4 reject with tcp reset 2>/dev/null || true
 
 log "4) 写入 kickwatch 主程序 /usr/local/bin/xrayr-kickwatch.sh"
 cat >/usr/local/bin/xrayr-kickwatch.sh <<'SH'
@@ -76,7 +77,7 @@ fetch_allowed_ids() {
 
 get_ips_for_uid_v4() {
   local uid="$1"
-  tail -n 5000 "$XRAY_LOG" 2>/dev/null \
+  tail -n 8000 "$XRAY_LOG" 2>/dev/null \
     | grep "@v2board.user|${uid}" \
     | sed -n 's/.* \([0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+\):[0-9]\+ accepted.*/\1/p' \
     | tail -n 30 \
@@ -85,9 +86,13 @@ get_ips_for_uid_v4() {
 
 ban_ip_now_v4() {
   local ip="$1"
+
   nft add element inet xraykick blocked4 "{ $ip timeout $BAN_TTL; }" 2>/dev/null || \
   nft add element inet xraykick blocked4 "{ $ip timeout $BAN_TTL }" 2>/dev/null || true
+
+  conntrack -D -p tcp --orig-src "$ip" --dport "$PORT" 2>/dev/null || true
   conntrack -D -p tcp -s "$ip" --dport "$PORT" 2>/dev/null || true
+  conntrack -D -p tcp --reply-src "$ip" --sport "$PORT" 2>/dev/null || true
 }
 
 unban_ip_v4() {
@@ -108,14 +113,17 @@ while true; do
     removed="$(comm -23 "$STATE_ALLOWED" "$new" || true)"
     added="$(comm -13 "$STATE_ALLOWED" "$new" || true)"
 
+    # 用户被移除：立即 ban + kill
     if [ -n "$removed" ]; then
       while read -r uid; do
         [ -n "$uid" ] || continue
         echo "[kickwatch] user removed: id=$uid, kick now..." >&2
+
         ips="$(get_ips_for_uid_v4 "$uid" || true)"
         if [ -n "$ips" ]; then
           file="$KICK_DIR/$uid"
           : >"$file"
+
           while read -r ip; do
             [ -n "$ip" ] || continue
             echo "$ip" >>"$file"
@@ -128,6 +136,7 @@ while true; do
       done <<<"$removed"
     fi
 
+    # 用户恢复：立即解封
     if [ -n "$added" ]; then
       while read -r uid; do
         [ -n "$uid" ] || continue
@@ -148,15 +157,16 @@ while true; do
     rm -f "$new"
     echo "[kickwatch] fetch users failed, retry..." >&2
   fi
+
   sleep "$POLL_SEC"
 done
 SH
 chmod +x /usr/local/bin/xrayr-kickwatch.sh
 
 log "5) 写入 systemd 并启动"
-cat >/etc/systemd/system/xrayr-kickwatch.service <<EOF2
+cat >/etc/systemd/system/xrayr-kickwatch.service <<EOF
 [Unit]
-Description=XrayR Kickwatch (ban ${BAN_TTL} and kill connections)
+Description=XrayR Kickwatch (hard kick: RST + conntrack delete)
 After=network-online.target xrayr.service
 Wants=network-online.target xrayr.service
 
@@ -175,7 +185,7 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF2
+EOF
 
 systemctl daemon-reload
 systemctl enable --now xrayr-kickwatch
