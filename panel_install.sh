@@ -49,10 +49,10 @@ cd /opt/Xboard
 docker compose pull || true
 
 if [ ! -f /opt/Xboard/.xboard_installed ]; then
-  log "首次初始化 Xboard"
+  log "首次初始化 Xboard（SQLite + Docker 内置 Redis）"
   docker compose run --rm \
     -e ENABLE_SQLITE=true \
-    -e ENABLE_REDIS=false \
+    -e ENABLE_REDIS=true \
     -e ADMIN_ACCOUNT="${ADMIN_EMAIL}" \
     web php artisan xboard:install | tee /opt/xboard_install.log
   touch /opt/Xboard/.xboard_installed
